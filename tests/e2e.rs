@@ -1701,6 +1701,7 @@ sources = ["src/Main.java"]
     assert!(out.contains("java-run-ok"), "java 输出不正确: {out}");
 }
 
+#[cfg(unix)]
 #[test]
 fn install_directory_handles_symlink_loops() {
     let d = tmpdir("symlink-loop");

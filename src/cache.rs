@@ -121,9 +121,19 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
     fn tmpdir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("nsbuild-cache-{}", std::process::id()));
+        let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "nsbuild-cache-{}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t"),
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
     }
