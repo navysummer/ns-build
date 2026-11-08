@@ -1,0 +1,26 @@
+[package]
+name = "ns-build"
+version = "0.1.0"
+edition = "2021"
+description = "ns-build: 现代化跨平台声明式构建系统"
+license = "MIT"
+
+[lib]
+name = "ns_build"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ns-build"
+path = "src/main.rs"
+
+[dependencies]
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+blake3 = "1"
+glob = "0.3"
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
