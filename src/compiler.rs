@@ -702,6 +702,7 @@ mod tests {
         assert!(!is_cxx(Path::new("a.c")));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn rpath_flags_emitted() {
         let mut t = target("a", TargetKind::Exe);
@@ -711,7 +712,8 @@ mod tests {
             &[PathBuf::from("a.o")],
             &PathBuf::from("a"),
             Host::current(),
-            Profile::Release, false
+            Profile::Release,
+            false,
         );
         assert!(cmd.contains(&"-Wl,-rpath,/opt/lib".to_string()));
         assert!(cmd.contains(&"-Wl,-rpath,$ORIGIN/../lib".to_string()));

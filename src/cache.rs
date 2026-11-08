@@ -127,10 +127,16 @@ mod tests {
 
     fn tmpdir() -> PathBuf {
         let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        let tname = std::thread::current()
+            .name()
+            .unwrap_or("t")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect::<String>();
         let d = std::env::temp_dir().join(format!(
             "nsbuild-cache-{}-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("t"),
+            tname,
             n
         ));
         let _ = std::fs::remove_dir_all(&d);
