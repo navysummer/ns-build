@@ -10,6 +10,9 @@
 - **分步构建**：`kind = "object"` 目标只产出 `.o`，供其他目标链接。
 - **并行构建**：`-j N` 控制并行度，默认 CPU 核数；unity build 合并多源文件减少启动开销。
 - **跨平台跨架构**：OS/架构检测、`os`/`arch` 平台过滤、`[[toolchains]]` 交叉工具链。
+- **多语言**：`language` 字段支持 c / c++ / rust / go / java / zig / python / shell。
+- **声明式语法扩展**：`${var}` 变量替换、`when` 条件构建、`include` 子脚本、`[[tests]]`、`pkg_config`、`[[install_headers]]`、`c_std`/`cxx_std`。
+- **工具链集成**：构建时自动生成 `build/compile_commands.json`（CMake 兼容，供 clangd/IDE）。
 
 ## 构建脚本（`ns-build.toml`）格式
 
@@ -17,8 +20,8 @@
 [project]
 name = "hello"
 version = "0.1.0"
-root = "src"          # 源码根（相对脚本）
-out = "build"         # 产物目录
+root = "src"          # 源码根（相对脚本），sources 相对它解析；init 默认生成
+out = "build"         # 产物目录（默认 build）
 
 [defaults]
 cc = "cc"             # 编译器（gcc/clang/cc）
@@ -32,16 +35,18 @@ include_dirs = []     # 全局 include 目录
 defines = []          # 全局宏定义 (-D)
 profile = "release"   # release | debug
 parallel = 0          # 0 = CPU 核数
-unity = "auto"        # off | on | auto
+unity = "auto"        # off | on | auto（auto = ≥4 源自动分组，组数≈n/4，封顶并行度）
 strip = false
 warnings = true
+toolchain = "mingw"   # 可选：默认工具链名；targets 可逐个覆盖
 cache = ".ns-cache"   # 增量缓存目录
 
 [[targets]]
 name = "app"
-kind = "exe"          # exe | lib | static | object | phony
-cc = "gcc"            # 覆盖 defaults.cc
-sources = ["src/**/*.c"]   # 支持 glob
+kind = "exe"          # exe | lib | static | object | module | interface | phony
+cc = "gcc"            # 覆盖 defaults.cc（覆盖工具链）
+toolchain = "mingw"   # 可选：指定 [[toolchains]]（覆盖 defaults.toolchain）
+sources = ["src/**/*.c"]   # 支持 glob，相对 project.root
 include_dirs = []
 flags = []
 cflags = []
@@ -50,16 +55,22 @@ link = ["m", "pthread"]     # 链接库（-l）或路径
 link_dirs = []
 link_flags = []
 defines = []
-deps = ["core"]       # 依赖其他 target（对象并入链接）
-output = "app"        # 产物名（默认 target 名）
+deps = ["core"]       # object 库对象并入；静态/动态库产物直接链接，静态链式依赖递归收集
+output = "app"        # 产物名（默认 target 名 + 平台后缀：.exe / lib*.so|.dylib|.dll / lib*.a）
 groups = 2            # unity 分组数（每组合并编译一个 .o）
 group_size = 4        # 每组源文件数（与 groups 二选一）
 parallel = true       # 是否参与并行
-os = ["linux", "macos"]   # 平台过滤
+os = ["linux", "macos"]   # 平台过滤（按目标平台，即工具链平台）
 arch = ["x86_64"]
 profile = "release"
 strip = false
 install = true
+language = "c"        # c | c++ | rust | go | java | zig | python | shell（省略按源文件后缀推断 C/C++）
+when = 'os == "linux"'  # 条件构建表达式（支持 && || ! 与括号分组）
+pkg_config = []       # pkg-config 包（--cflags 编译展开 / --libs 链接展开）
+c_std = "c11"         # 编译标准（c11/gnu11/c17）
+cxx_std = "c++17"     # C++ 标准（c++17/c++20）
+pch = "include/pre.h" # 预编译头（-include）
 
 [targets.hooks]       # 构建前后钩子
 before = ["echo building"]
@@ -80,14 +91,16 @@ sysroot = "/usr/x86_64-w64-mingw32"
 |------|------|------|
 | `exe` | 可执行文件 | 编译源 → 链接 |
 | `lib` | 动态库 (`.so`/`.dylib`/`.dll`) | `-shared` 链接 |
+| `module` | 动态模块（`.so`/`.dylib`/`.dll`） | dlopen 用，默认不进链接 |
 | `static` | 静态库 (`.a`) | `ar rcs` 归档 |
 | `object` | `.o` 文件 | 分步构建中间产物，供链接 |
+| `interface` | 无产物 | 头文件库：只向依赖者传递 include_dirs/defines |
 | `phony` | 无 | 聚合节点，仅依赖 |
 
 ## CLI 命令
 
 ```bash
-ns-build build [-j N] [--debug] [--verbose] [--quiet] [目标...]
+ns-build build [-j N] [--release|--debug|--profile <配置>] [--define name=value] [--verbose] [--quiet] [目标...]
 ns-build clean
 ns-build test [--all]
 ns-build install [--prefix <路径>]
@@ -104,7 +117,7 @@ src/
 ├── lib.rs           # 模块根，重新导出公共 API
 ├── platform.rs      # OS/架构检测、命名规则（dylib/exe/static 后缀）
 ├── script.rs        # ns-build.toml schema、解析、校验、规范化（glob 展开/平台过滤/默认值合并）
-├── depfile.rs       # Makefile 风格 .d 依赖解析（-MMD）
+├── depfile.rs       # Makefile 风格 .d 依赖解析（-MMD，支持 `\ ` 转义空格、`$$` 转义美元符）
 ├── cache.rs         # blake3 内容指纹增量缓存（持久化 JSON）
 ├── fsutil.rs        # 哈希/路径规范化/原子写/时间戳
 ├── compiler.rs      # 编译/链接/归档命令生成 + unity 合并源
@@ -119,12 +132,12 @@ src/
 ### 数据流
 
 1. `load(dir)` → 读 `ns-build.toml`，`BuildScript::parse` 反序列化。
-2. `BuildScript::resolve(dir)` → `ResolvedScript`：glob 展开、平台过滤、工具链匹配、defaults 合并、相对路径解析。
+2. `BuildScript::resolve(dir)` → `ResolvedScript`：glob 展开、平台过滤（按**目标平台**）、工具链选择（target > defaults > os/arch 自动匹配）、defaults 合并、相对路径解析、依赖使用要求**传递性传播**（`include_dirs`/`defines`/`link`/`pkg_config` 等，INTERFACE/头文件库只传 include/defines）。
 3. `planner::plan(script, cache)` → `Plan { graph, outputs, skipped }`：
-   - 第一遍：每个非 phony target 生成对象编译节点（unity 分组）。
-   - 第二遍：构造链接/归档节点，`deps` 对象并入链接输入。
+   - 第一遍：每个非 phony/interface target 生成对象编译节点（unity 分组）。
+   - 第二遍：构造链接/归档节点；`deps` 处理：object 对象并入、静态/动态库产物直接链接、静态链式依赖递归收集；链接构建树内 `.so`/`.dylib` 自动加 `-Wl,-rpath`。
    - 第三遍：target 间依赖边 + 钩子节点。
-   - 每任务用 `cache.hit` 判定是否可跳过。
+   - 每任务用 `cache.hit` 判定是否可跳过（无产物节点不缓存、不传播失效）。
 4. `executor::execute(plan, cache, opts, cwd)` → `ExecReport`：
    - Kahn 就绪队列，就绪任务派发到线程池（≤ `parallel`）。
    - 串行任务（钩子）等待并发清空。
@@ -141,12 +154,32 @@ src/
 ## 测试
 
 ```bash
-cargo test --lib      # 单元测试（解析/depfile/缓存/图/调度/编译器）
-cargo test --test e2e # 端到端：真实 C 项目构建 + 运行 + 增量 + 分步 + unity + 安装
+cargo test --lib      # 单元测试（43：解析/depfile/缓存/图/调度/编译器/脚本规范化）
+cargo test --test e2e # 端到端（15：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置覆盖/init）
+cargo test --test languages # 多语言 e2e（8：含 C++ unity 与 C++ 推断）
 cargo test --test perf # 性能：300 文件全量 vs 增量（增量应显著更快）
+./scripts/bench.sh    # 与 CMake + Ninja 对比基准（NS_BENCH_N 可调规模）
 ```
 
-性能结果（本机验证）：300 文件全量 ≈ 0.71s，增量 ≈ 0.03s（约 24× 加速）。
+**当前全部绿**：43 lib + 3 main(CLI) + 15 e2e + 8 languages + 1 perf = **70 个测试，0 警告 0 错误**（不使用 `#[allow]`/`#[warn]` 等抑制手段；`cargo clippy --all-targets` 亦零警告）。
+
+**性能对比**（300 文件 C 项目，macOS 12 核 clang 17，`scripts/bench.sh`）：
+
+| 方式 | 全量 | 增量 | 改 1 文件 |
+|------|------|------|-----------|
+| ns-build（unity auto → 12 组） | ≈0.27s | ≈0.03s | ≈0.18s |
+| ns-build（unity off，逐文件 302 任务） | ≈3.0s | ≈0.20s | ≈0.35s |
+| CMake + Ninja（302 任务） | ≈3.3s | ≈0.04s | ≈0.21s |
+
+ns-build 默认 unity 自动分组，比 CMake 快约 12×；逐文件模式与 CMake+Ninja 基本持平。
+
+## 已知边界
+
+- 无 MSVC 支持（命令行假定 GCC/Clang/MinGW 风格）。
+- 钩子只在构建前后执行，不追踪自定义产物；无 `add_custom_command(OUTPUT)` 式生成步骤。
+- 单配置构建（用 `--profile` 切换）；`when` 覆盖条件编译的常见场景，无生成器表达式。
+- `pkg-config` 查询失败时按无该依赖处理（不展开 `-I`/`-l`），不阻塞构建。
+- `install` 会构建所有目标（不限于安装产物）。
 
 ## 编码约定
 
@@ -154,3 +187,4 @@ cargo test --test perf # 性能：300 文件全量 vs 增量（增量应显著�
 - 新功能加对应测试；改动行为需更新相关测试。
 - 编译命令生成集中在 `compiler.rs`，调度逻辑在 `executor.rs`，不跨模块混杂。
 - 错误返回 `Result<_, String>`，消息含具体上下文（文件路径、target 名）。
+- 质量门槛：`cargo build`、`cargo test --all`、`cargo clippy --all-targets` 全部 0 警告 0 错误；禁止为了消警告添加 `#[allow]` / `#[warn]` 等抑制。

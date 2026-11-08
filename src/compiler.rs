@@ -39,6 +39,15 @@ pub enum CompileKind {
     Command,
 }
 
+/// 判断路径是否为动态库（含 macOS `.dylib`、Linux `.so`/`.so.N`、Windows `.dll`）。
+pub fn is_shared_lib(path: &Path) -> bool {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    name.ends_with(".dylib")
+        || name.ends_with(".so")
+        || name.ends_with(".dll")
+        || name.contains(".so.")
+}
+
 /// 判断文件是否 C++ 源。
 pub fn is_cxx(path: &Path) -> bool {
     matches!(
@@ -55,103 +64,90 @@ pub fn is_c_source(path: &Path) -> bool {
     )
 }
 
+/// 一次编译（单文件或 unity 单元）的上下文。
+pub struct CompileContext<'a> {
+    pub cc: &'a str,
+    pub target: &'a ResolvedTarget,
+    pub profile: Profile,
+    pub is_cxx: bool,
+}
+
+impl<'a> CompileContext<'a> {
+    /// 追加通用编译选项（优化/标准/警告/宏/头文件路径/标志/depfile/PIC）。
+    fn push_common_flags(&self, cmd: &mut Vec<String>) {
+        for f in self.profile.opt_flags() {
+            cmd.push(f.to_string());
+        }
+        let t = self.target;
+        if self.is_cxx {
+            let std = t.cxx_std.as_deref().unwrap_or("c++17");
+            cmd.push(format!("-std={std}"));
+        } else {
+            let std = t.c_std.as_deref().unwrap_or("c11");
+            cmd.push(format!("-std={std}"));
+        }
+        // 警告。
+        if t.warnings {
+            cmd.push("-Wall".into());
+            if self.is_cxx {
+                cmd.push("-Wextra".into());
+            }
+        }
+        // 宏定义。
+        for d in &t.defines {
+            cmd.push(format!("-D{d}"));
+        }
+        // include 目录。
+        for inc in &t.include_dirs {
+            cmd.push(format!("-I{}", inc.display()));
+        }
+        // 预编译头（`-include <path>`：必须是两个独立参数）。
+        if let Some(pch) = &t.pch {
+            cmd.push("-include".into());
+            cmd.push(pch.clone());
+        }
+        // 编译标志（全局/target 的 flags + 语言专属标志）。
+        for f in &t.flags {
+            cmd.push(f.clone());
+        }
+        let lang_flags = if self.is_cxx { &t.cxxflags } else { &t.cflags };
+        for f in lang_flags {
+            cmd.push(f.clone());
+        }
+        // 生成依赖文件 + 位置无关代码。
+        cmd.push("-MMD".into());
+        cmd.push("-MF".into());
+    }
+}
+
 /// 构建编译单源文件的命令。
 pub fn compile_command(
-    cc: &str,
+    ctx: &CompileContext<'_>,
     src: &Path,
     out: &Path,
     depfile: &Path,
-    target: &ResolvedTarget,
-    host: Host,
-    profile: Profile,
-    is_cxx: bool,
 ) -> Vec<String> {
-    let mut cmd = vec![cc.to_string()];
-    // 基础优化/调试。
-    for f in profile.opt_flags() {
-        cmd.push(f.to_string());
-    }
-    if target.strip {
-        cmd.push("-s".into());
-    }
-    if is_cxx {
-        cmd.push("-std=c++17".into());
-        cmd.push("-fPIC".into());
-    } else {
-        cmd.push("-std=c11".into());
-    }
-    // 警告。
-    if is_cxx {
-        cmd.push("-Wall".into());
-        cmd.push("-Wextra".into());
-    } else {
-        cmd.push("-Wall".into());
-    }
-    // 宏定义。
-    for d in &target.defines {
-        cmd.push(format!("-D{d}"));
-    }
-    // include 目录。
-    for inc in &target.include_dirs {
-        cmd.push(format!("-I{}", inc.display()));
-    }
-    // 编译标志（target + defaults）。
-    for f in &target.flags {
-        cmd.push(f.clone());
-    }
-    for f in &target.cflags {
-        cmd.push(f.clone());
-    }
-    // 生成依赖文件 + 位置无关代码。
-    cmd.push("-MMD".into());
-    cmd.push("-MF".into());
+    let mut cmd = vec![ctx.cc.to_string()];
+    ctx.push_common_flags(&mut cmd);
     cmd.push(depfile.to_string_lossy().into_owned());
     cmd.push("-fPIC".into());
     cmd.push("-c".into());
     cmd.push(src.to_string_lossy().into_owned());
     cmd.push("-o".into());
     cmd.push(out.to_string_lossy().into_owned());
-    let _ = host;
     cmd
 }
 
 /// unity build：将多个源文件合成一个合并单元（`#include` 全部源），
 /// 编译为单个 `.o`，大幅减少编译启动开销。
 pub fn unity_compile_command(
-    cc: &str,
-    srcs: &[PathBuf],
+    ctx: &CompileContext<'_>,
     unity_src: &Path,
     out: &Path,
     depfile: &Path,
-    target: &ResolvedTarget,
-    profile: Profile,
 ) -> Vec<String> {
-    // 生成合并源文件：每个源 `#include "相对路径"`。
-    // （由调用方生成，此处仅构建命令。）
-    let _ = srcs;
-    let mut cmd = vec![cc.to_string()];
-    for f in profile.opt_flags() {
-        cmd.push(f.to_string());
-    }
-    if target.strip {
-        cmd.push("-s".into());
-    }
-    cmd.push("-std=c11".into());
-    cmd.push("-Wall".into());
-    for d in &target.defines {
-        cmd.push(format!("-D{d}"));
-    }
-    for inc in &target.include_dirs {
-        cmd.push(format!("-I{}", inc.display()));
-    }
-    for f in &target.flags {
-        cmd.push(f.clone());
-    }
-    for f in &target.cflags {
-        cmd.push(f.clone());
-    }
-    cmd.push("-MMD".into());
-    cmd.push("-MF".into());
+    let mut cmd = vec![ctx.cc.to_string()];
+    ctx.push_common_flags(&mut cmd);
     cmd.push(depfile.to_string_lossy().into_owned());
     cmd.push("-fPIC".into());
     cmd.push("-c".into());
@@ -179,7 +175,10 @@ pub fn link_command(
     host: Host,
     profile: Profile,
 ) -> Vec<String> {
-    let mut cmd = vec![target.cc.clone()];
+    let is_cpp = matches!(target.language, crate::script::Language::Cpp);
+    let linker = if is_cpp { target.cxx.clone() } else { target.cc.clone() };
+    let mut cmd = vec![linker];
+
     for f in profile.opt_flags() {
         cmd.push(f.to_string());
     }
@@ -196,6 +195,22 @@ pub fn link_command(
     for o in objs {
         cmd.push(o.to_string_lossy().into_owned());
     }
+    // 直接链接动态库时写入构建树 rpath，保证未安装前也能运行。
+    if !host.os.is_windows_family() {
+        let mut rpaths: Vec<PathBuf> = Vec::new();
+        for o in objs {
+            if is_shared_lib(o) {
+                if let Some(parent) = o.parent() {
+                    if !parent.as_os_str().is_empty() && !rpaths.contains(&parent.to_path_buf()) {
+                        rpaths.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+        for p in rpaths {
+            cmd.push(format!("-Wl,-rpath,{}", p.display()));
+        }
+    }
     for l in &target.link {
         // 已带路径或绝对路径直接用，否则 `-l`。
         if l.starts_with('/') || l.starts_with('.') || l.contains('/') {
@@ -204,11 +219,25 @@ pub fn link_command(
             cmd.push(format!("-l{l}"));
         }
     }
+    // pkg-config 包：展开 `pkg-config --libs <pkg>`。
+    for pkg in &target.pkg_config {
+        let out = std::process::Command::new("pkg-config")
+            .args(["--libs", pkg])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                cmd.extend(s.split_whitespace().map(|s| s.to_string()));
+            }
+            // 找不到包或运行失败：回退为 `-l<pkg>`，不阻塞构建。
+            _ => cmd.push(format!("-l{pkg}")),
+        }
+    }
     if target.strip {
         cmd.push("-s".into());
     }
     match target.kind {
-        crate::script::TargetKind::Lib => {
+        crate::script::TargetKind::Lib | crate::script::TargetKind::Module => {
             cmd.push("-shared".into());
             cmd.push("-o".into());
             cmd.push(out.to_string_lossy().into_owned());
@@ -240,25 +269,36 @@ pub fn archive_command(ar: &str, objs: &[PathBuf], out: &Path) -> Vec<String> {
     cmd
 }
 
-/// 从目标 + 对象文件构建链接/归档任务。
+/// 从目标 + 输入构建链接/打包任务（按语言分派）。
 pub fn make_link_task(
     target: &ResolvedTarget,
-    objs: Vec<PathBuf>,
+    inputs: Vec<PathBuf>,
     host: Host,
     profile: Profile,
     ar: &str,
 ) -> CompileTask {
-    let cmd = match target.kind {
-        crate::script::TargetKind::Static => archive_command(ar, &objs, &target.output),
-        _ => link_command(target, &objs, &target.output, host, profile),
+    use crate::script::{Language, TargetKind};
+
+    let cmd = match target.language {
+        Language::Rust => rust_build_command(target, &inputs),
+        Language::Go => go_build_command(target, &inputs),
+        Language::Java => java_build_command(target, &inputs),
+        Language::Zig => zig_build_command(target, &inputs),
+        Language::Python => script_package_command(target, &inputs, host),
+        Language::Shell => script_package_command(target, &inputs, host),
+        // C / C++：原有编译链接。
+        _ => match target.kind {
+            TargetKind::Static => archive_command(ar, &inputs, &target.output),
+            _ => link_command(target, &inputs, &target.output, host, profile),
+        },
     };
     CompileTask {
         key: format!("link:{}", target.name),
         kind: match target.kind {
-            crate::script::TargetKind::Static => CompileKind::Archive,
+            TargetKind::Static => CompileKind::Archive,
             _ => CompileKind::Link,
         },
-        inputs: objs,
+        inputs,
         depfile: None,
         output: target.output.clone(),
         command: cmd,
@@ -267,16 +307,136 @@ pub fn make_link_task(
     }
 }
 
+/// Rust：`rustc <主源> -o <out>`。
+fn rust_build_command(target: &ResolvedTarget, srcs: &[PathBuf]) -> Vec<String> {
+    let mut cmd = vec!["rustc".to_string()];
+    cmd.push("--edition".into());
+    cmd.push("2021".into());
+    match target.kind {
+        crate::script::TargetKind::Lib | crate::script::TargetKind::Module => {
+            cmd.push("--crate-type".into());
+            cmd.push("cdylib".into());
+        }
+        crate::script::TargetKind::Static => {
+            cmd.push("--crate-type".into());
+            cmd.push("staticlib".into());
+        }
+        _ => {}
+    }
+    for d in &target.link_dirs {
+        cmd.push("-L".into());
+        cmd.push(d.to_string_lossy().into_owned());
+    }
+    for f in &target.flags {
+        cmd.push(f.clone());
+    }
+    if let Some(main) = srcs.first() {
+        cmd.push(main.to_string_lossy().into_owned());
+    }
+    for l in &target.link {
+        if l.starts_with('/') || l.starts_with('.') || l.contains('/') {
+            cmd.push(l.clone());
+        } else {
+            cmd.push(format!("-l{l}"));
+        }
+    }
+    cmd.push("-o".into());
+    cmd.push(target.output.to_string_lossy().into_owned());
+    cmd
+}
+
+/// Go：`go build -o <out> <源...>`。
+fn go_build_command(target: &ResolvedTarget, srcs: &[PathBuf]) -> Vec<String> {
+    let mut cmd = vec!["go".to_string(), "build".into()];
+    for f in &target.flags {
+        cmd.push(f.clone());
+    }
+    cmd.push("-o".into());
+    cmd.push(target.output.to_string_lossy().into_owned());
+    for s in srcs {
+        cmd.push(s.to_string_lossy().into_owned());
+    }
+    cmd
+}
+
+/// Java：`javac -d <out>/classes <源...>`。
+fn java_build_command(target: &ResolvedTarget, srcs: &[PathBuf]) -> Vec<String> {
+    let mut cmd = vec!["javac".to_string()];
+    for f in &target.flags {
+        cmd.push(f.clone());
+    }
+    let classes = target
+        .output
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("classes");
+    cmd.push("-d".into());
+    cmd.push(classes.to_string_lossy().into_owned());
+    for s in srcs {
+        cmd.push(s.to_string_lossy().into_owned());
+    }
+    cmd
+}
+
+/// Zig：`zig build-exe` / `build-lib`。
+fn zig_build_command(target: &ResolvedTarget, srcs: &[PathBuf]) -> Vec<String> {
+    let mut cmd = vec!["zig".to_string()];
+    if target.kind == crate::script::TargetKind::Lib {
+        cmd.push("build-lib".into());
+    } else {
+        cmd.push("build-exe".into());
+    }
+    for f in &target.flags {
+        cmd.push(f.clone());
+    }
+    for s in srcs {
+        cmd.push(s.to_string_lossy().into_owned());
+    }
+    cmd.push(format!("-femit-bin={}", target.output.to_string_lossy()));
+    cmd
+}
+
+/// Python/Shell：拷贝源为可执行脚本。
+fn script_package_command(target: &ResolvedTarget, srcs: &[PathBuf], host: Host) -> Vec<String> {
+    let src = srcs
+        .first()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let out = target.output.to_string_lossy().into_owned();
+    if host.os.is_windows_family() {
+        // Windows 无 chmod；copy /Y 保留原文件内容。
+        vec![
+            "cmd".into(),
+            "/C".into(),
+            format!("copy /Y \"{src}\" \"{out}\""),
+        ]
+    } else {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("cp -- '{}' '{}' && chmod +x '{}'", shell_quote(&src), shell_quote(&out), shell_quote(&out)),
+        ]
+    }
+}
+
+/// 单引号 shell 转义。
+fn shell_quote(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::TargetKind;
+    use crate::script::{Language, TargetKind};
 
     fn target(name: &str, kind: TargetKind) -> ResolvedTarget {
         ResolvedTarget {
             name: name.into(),
             kind,
             cc: "cc".into(),
+            cxx: "c++".into(),
+            ar: "ar".into(),
+            host: Host::current(),
             sources: vec![],
             include_dirs: vec![],
             flags: vec![],
@@ -294,7 +454,14 @@ mod tests {
             hooks: Default::default(),
             profile: Profile::Release,
             strip: false,
+            warnings: true,
             install: true,
+            language: Language::C,
+            c_std: None,
+            cxx_std: None,
+            pkg_config: vec![],
+            when: None,
+            pch: None,
         }
     }
 
@@ -302,14 +469,15 @@ mod tests {
     fn compile_has_depfile_and_pic() {
         let t = target("a", TargetKind::Exe);
         let cmd = compile_command(
-            "gcc",
+            &CompileContext {
+                cc: "gcc",
+                target: &t,
+                profile: Profile::Release,
+                is_cxx: false,
+            },
             Path::new("a.c"),
             Path::new("a.o"),
             Path::new("a.d"),
-            &t,
-            Host::current(),
-            Profile::Release,
-            false,
         );
         assert!(cmd.iter().any(|c| c == "-c"));
         assert!(cmd.iter().any(|c| c == "-MMD"));
@@ -338,5 +506,63 @@ mod tests {
     fn is_cxx_detects() {
         assert!(is_cxx(Path::new("a.cpp")));
         assert!(!is_cxx(Path::new("a.c")));
+    }
+
+    #[test]
+    fn pch_uses_two_arguments() {
+        let mut t = target("a", TargetKind::Exe);
+        t.pch = Some("include/pre.h".into());
+        let cmd = compile_command(
+            &CompileContext {
+                cc: "cc",
+                target: &t,
+                profile: Profile::Release,
+                is_cxx: false,
+            },
+            Path::new("a.c"),
+            Path::new("a.o"),
+            Path::new("a.d"),
+        );
+        let pos = cmd.iter().position(|c| c == "-include").unwrap();
+        assert_eq!(cmd[pos + 1], "include/pre.h");
+    }
+
+    #[test]
+    fn cxx_uses_cxxflags_and_compiler() {
+        let mut t = target("a", TargetKind::Exe);
+        t.cflags = vec!["-DC_ONLY".into()];
+        t.cxxflags = vec!["-DCXX_ONLY".into()];
+        let cmd = compile_command(
+            &CompileContext {
+                cc: "c++",
+                target: &t,
+                profile: Profile::Release,
+                is_cxx: true,
+            },
+            Path::new("a.cpp"),
+            Path::new("a.o"),
+            Path::new("a.d"),
+        );
+        assert!(cmd.contains(&"-DCXX_ONLY".to_string()));
+        assert!(!cmd.contains(&"-DC_ONLY".to_string()));
+        assert!(cmd.contains(&"-std=c++17".to_string()));
+    }
+
+    #[test]
+    fn warnings_can_be_disabled() {
+        let mut t = target("a", TargetKind::Exe);
+        t.warnings = false;
+        let cmd = compile_command(
+            &CompileContext {
+                cc: "cc",
+                target: &t,
+                profile: Profile::Release,
+                is_cxx: false,
+            },
+            Path::new("a.c"),
+            Path::new("a.o"),
+            Path::new("a.d"),
+        );
+        assert!(!cmd.contains(&"-Wall".to_string()));
     }
 }

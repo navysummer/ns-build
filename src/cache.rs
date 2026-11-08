@@ -137,13 +137,13 @@ mod tests {
         std::fs::write(&out, "obj").unwrap();
 
         let mut cache = Cache::load(&d).unwrap();
-        assert!(!cache.hit("t:o:0", &[src.clone()], "h1"));
+        assert!(!cache.hit("t:o:0", std::slice::from_ref(&src), "h1"));
 
-        cache.record("t:o:0".into(), &[src.clone()], "h1".into(), vec![out.to_string_lossy().into()]);
-        assert!(cache.hit("t:o:0", &[src.clone()], "h1"));
+        cache.record("t:o:0".into(), std::slice::from_ref(&src), "h1".into(), vec![out.to_string_lossy().into()]);
+        assert!(cache.hit("t:o:0", std::slice::from_ref(&src), "h1"));
 
         // 命令指纹变化 → miss。
-        assert!(!cache.hit("t:o:0", &[src.clone()], "h2"));
+        assert!(!cache.hit("t:o:0", std::slice::from_ref(&src), "h2"));
     }
 
     #[test]
@@ -155,7 +155,7 @@ mod tests {
         std::fs::write(&out, "obj").unwrap();
 
         let mut cache = Cache::load(&d).unwrap();
-        cache.record("k".into(), &[src.clone()], "cmd".into(), vec![out.to_string_lossy().into()]);
+        cache.record("k".into(), std::slice::from_ref(&src), "cmd".into(), vec![out.to_string_lossy().into()]);
         cache.save().unwrap();
 
         let cache2 = Cache::load(&d).unwrap();

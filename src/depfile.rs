@@ -32,15 +32,47 @@ pub fn parse_depfile_str(text: &str) -> Result<BTreeSet<PathBuf>, String> {
             continue;
         };
         let rhs = &line[colon + 1..];
-        // 处理 `$` 转义（gcc 有时输出 `$$`）。
-        for tok in rhs.split_whitespace() {
-            let tok = tok.replace("$$", "$");
+        for tok in split_make_tokens(rhs) {
             if !tok.is_empty() {
                 deps.insert(PathBuf::from(tok));
             }
         }
     }
     Ok(deps)
+}
+
+/// 按 Makefile 规则拆分依赖 token：支持 `\ `（转义空格）与 `$$`（美元符）。
+fn split_make_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Make 用反斜杠转义空格等字符；其余反斜杠（如 Windows 路径）
+            // 原样保留。
+            '\\' => match chars.peek().copied() {
+                Some(n) if n.is_whitespace() || matches!(n, '#' | ':' | '\\' | '$') => {
+                    chars.next();
+                    cur.push(n);
+                }
+                _ => cur.push('\\'),
+            },
+            '$' if chars.peek() == Some(&'$') => {
+                chars.next();
+                cur.push('$');
+            }
+            c if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// 查找非 Windows 盘符的冒号（`C:\...` 的冒号不是分隔符）。
@@ -87,5 +119,13 @@ mod tests {
     fn handles_dollar_escape() {
         let deps = parse_depfile_str("a.o: b.c $$foo.h\n").unwrap();
         assert!(deps.contains(&PathBuf::from("$foo.h")));
+    }
+
+    #[test]
+    fn handles_escaped_spaces() {
+        let deps = parse_depfile_str("a.o: src/a\\ b.c src/x.h\n").unwrap();
+        assert!(deps.contains(&PathBuf::from("src/a b.c")));
+        assert!(deps.contains(&PathBuf::from("src/x.h")));
+        assert_eq!(deps.len(), 2);
     }
 }

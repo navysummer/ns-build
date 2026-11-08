@@ -13,9 +13,9 @@ use ns_build::script::load;
 const USAGE: &str = r#"ns-build — 现代化跨平台构建系统
 
 用法:
-  ns-build build [--release|--debug] [-j N] [--verbose] [--quiet] [目标...]
+  ns-build build [--release|--debug|--profile <配置>] [-j N] [--verbose] [--quiet] [目标...]
   ns-build clean
-  ns-build test [--all] [-j N]
+  ns-build test [--all] [--label <标签>] [-j N]
   ns-build install [--prefix <路径>]
   ns-build run <目标> [-- 参数...]
   ns-build show
@@ -23,9 +23,10 @@ const USAGE: &str = r#"ns-build — 现代化跨平台构建系统
   ns-build init [--name <名>]
 
 选项:
-  -j, --jobs <N>      并行任务数 (默认: CPU 核数)
+  -j, --jobs <N>      并行任务数 (默认: CPU 核数; 支持 -j4/-j8/-j100)
   --release           优化构建 (默认)
   --debug             调试构建
+  --profile <配置>    release | debug | relwithdebinfo | minsizerel
   --verbose           打印完整命令
   --quiet             只输出错误
   -h, --help          帮助
@@ -73,45 +74,66 @@ fn run(args: &[String]) -> Result<(), String> {
 /// 解析 -j / --release / --debug / --quiet / --verbose / 目标列表。
 struct BuildArgs {
     jobs: Option<usize>,
-    profile: ProfileFlag,
+    /// None = 使用脚本中的 `profile` / 默认 release。
+    profile: Option<ns_build::script::Profile>,
     quiet: bool,
     verbose: bool,
     targets: Vec<String>,
-}
-
-
-enum ProfileFlag {
-    Release,
-    Debug,
+    /// CLI 变量覆盖：`--define name=value`。
+    defines: std::collections::BTreeMap<String, String>,
 }
 
 fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
+    use ns_build::script::Profile;
     let mut out = BuildArgs {
         jobs: None,
-        profile: ProfileFlag::Release,
+        profile: None,
         quiet: false,
         verbose: false,
         targets: vec![],
+        defines: std::collections::BTreeMap::new(),
     };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-j" | "--jobs" | "--parallel" => {
                 i += 1;
-                let v = args.get(i).ok_or("-j 需要参数")?;
+                let v = args.get(i).ok_or("选项后需要并行数参数")?;
                 out.jobs = Some(v.parse().map_err(|_| format!("无效并行数 '{v}'"))?);
             }
-            "--release" => out.profile = ProfileFlag::Release,
-            "--debug" => out.profile = ProfileFlag::Debug,
+            t if parse_jobs_arg(t).is_some() => {
+                out.jobs = parse_jobs_arg(t);
+            }
+            "--release" => out.profile = Some(Profile::Release),
+            "--debug" => out.profile = Some(Profile::Debug),
+            "--profile" => {
+                i += 1;
+                let v = args.get(i).ok_or("--profile 需要参数 (release|debug|relwithdebinfo|minsizerel)")?;
+                out.profile = Some(match v.as_str() {
+                    "release" => Profile::Release,
+                    "debug" => Profile::Debug,
+                    "relwithdebinfo" | "relwithdeb" => Profile::RelWithDebInfo,
+                    "minsizerel" | "minsize" => Profile::MinSizeRel,
+                    other => return Err(format!("未知配置 '{other}'")),
+                });
+            }
             "--quiet" | "-q" => out.quiet = true,
             "--verbose" | "-v" => out.verbose = true,
+            t if t.starts_with("--define") => {
+                let v = t.strip_prefix("--define=")
+                    .or_else(|| t.strip_prefix("--define"))
+                    .unwrap_or("");
+                if let Some((name, value)) = v.split_once('=') {
+                    out.defines.insert(name.to_string(), value.to_string());
+                } else if !v.is_empty() {
+                    out.defines.insert(v.to_string(), "1".to_string());
+                } else {
+                    return Err("--define 需要 name=value".into());
+                }
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
-            }
-            t if t.starts_with("-j") && t.len() > 2 => {
-                let v = &t[2..];
-                out.jobs = Some(v.parse().map_err(|_| format!("无效并行数 '{v}'"))?);
             }
             t if t.starts_with('-') => return Err(format!("未知选项 '{t}'")),
             t => out.targets.push(t.to_string()),
@@ -121,12 +143,68 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
     Ok(out)
 }
 
+/// 正则识别 `-j4`、`-j8`、`-j100`、`--jobs=8`、`--parallel=4`。
+/// 返回 Some(并行数)；None 表示不是 jobs 参数。
+fn parse_jobs_arg(t: &str) -> Option<usize> {
+    if let Some(rest) = t.strip_prefix("-j") {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            return rest.parse().ok();
+        }
+    }
+    for prefix in ["--jobs=", "--parallel="] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                return rest.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// 展开目标列表：加入递归 `deps`，返回可用于任务过滤的目标名集合。
+fn expand_targets(
+    script: &ns_build::script::ResolvedScript,
+    requested: &[String],
+) -> Result<Vec<String>, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let by_name: BTreeMap<&str, &ns_build::script::ResolvedTarget> =
+        script.targets.iter().map(|t| (t.name.as_str(), t)).collect();
+    let mut allowed: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<String> = Vec::new();
+    for name in requested {
+        let t = by_name
+            .get(name.as_str())
+            .ok_or_else(|| format!("未知目标 '{name}'"))?;
+        stack.push(t.name.clone());
+    }
+    while let Some(name) = stack.pop() {
+        if !allowed.insert(name.clone()) {
+            continue;
+        }
+        if let Some(t) = by_name.get(name.as_str()) {
+            for dep in &t.deps {
+                if !allowed.contains(dep) {
+                    stack.push(dep.clone());
+                }
+            }
+        }
+    }
+    Ok(allowed.into_iter().collect())
+}
+
+
 
 fn cmd_build(args: &[String]) -> Result<(), String> {
     let ba = parse_build_args(args)?;
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
-    let resolved = script.resolve(&script_dir)?;
+    let resolved = script.resolve(&script_dir, &ba.defines, ba.profile)?;
+    // 指定目标时自动包含其（递归）依赖。
+    let targets = if ba.targets.is_empty() {
+        None
+    } else {
+        Some(expand_targets(&resolved, &ba.targets)?)
+    };
     let mut cache = Cache::load(&resolved.cache_dir)?;
     let mut p = plan(&resolved, &cache)?;
 
@@ -134,10 +212,17 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         parallel: ba.jobs.unwrap_or(resolved.parallel),
         quiet: ba.quiet,
         verbose: ba.verbose,
-        targets: if ba.targets.is_empty() { None } else { Some(ba.targets) },
+        targets,
     };
     let report = execute(&mut p, &mut cache, &opts, &resolved.dir)?;
     cache.save()?;
+    // 生成 compile_commands.json（供 clangd / IDE）。
+    let cc_json = ns_build::planner::generate_compile_commands(&p, &resolved.dir);
+    let cc_path = resolved.out_dir.join("compile_commands.json");
+    if let Some(parent) = cc_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&cc_path, cc_json);
 
     println!(
         "[ns-build] 完成: {} 构建, {} 跳过, {} 失败 / {} 任务, {:.2}s",
@@ -152,7 +237,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
 fn cmd_clean() -> Result<(), String> {
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
-    let resolved = script.resolve(&script_dir)?;
+    let resolved = script.resolve_default(&script_dir)?;
     // 删除 out 目录与缓存。
     for p in [&resolved.out_dir, &resolved.cache_dir] {
         if p.exists() {
@@ -167,19 +252,49 @@ fn cmd_clean() -> Result<(), String> {
 
 fn cmd_test(args: &[String]) -> Result<(), String> {
     let mut all = false;
-    let jobs: Option<usize> = None;
-    for a in args {
-        match a.as_str() {
+    let mut labels: Vec<String> = vec![];
+    let mut jobs: Option<usize> = None;
+    let mut profile_args: Vec<String> = vec![];
+    let mut verbose = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--all" => all = true,
-            "-j" | "--jobs" | "--parallel" => {
-                // 下一项
+            "--label" => {
+                i += 1;
+                let v = args.get(i).ok_or("--label 需要标签名")?;
+                labels.push(v.clone());
             }
+            v if v.starts_with("--label=") => labels.push(v["--label=".len()..].to_string()),
+            "-j" | "--jobs" | "--parallel" => {
+                i += 1;
+                let v = args.get(i).ok_or("选项后需要并行数参数")?;
+                jobs = Some(v.parse().map_err(|_| format!("无效并行数 '{v}'"))?);
+            }
+            t if parse_jobs_arg(t).is_some() => jobs = parse_jobs_arg(t),
+            "--release" | "--debug" => profile_args.push(args[i].clone()),
+            "--profile" => {
+                i += 1;
+                profile_args.push("--profile".into());
+                profile_args.push(
+                    args.get(i).ok_or("--profile 需要参数")?.clone(),
+                );
+            }
+            "--verbose" | "-v" => {
+                verbose = true;
+                profile_args.push("--verbose".into());
+            }
+            "--quiet" | "-q" => profile_args.push("--quiet".into()),
             v if v.starts_with('-') => return Err(format!("未知选项 '{v}'")),
             _ => {}
         }
+        i += 1;
     }
-    // 先构建（quiet），再运行测试。
-    let mut build_args = vec!["--quiet".to_string()];
+    // 先构建，再运行测试。
+    let mut build_args = profile_args;
+    if !verbose {
+        build_args.push("--quiet".to_string());
+    }
     if let Some(j) = jobs {
         build_args.push("-j".to_string());
         build_args.push(j.to_string());
@@ -187,8 +302,8 @@ fn cmd_test(args: &[String]) -> Result<(), String> {
     cmd_build(&build_args)?;
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
-    let resolved = script.resolve(&script_dir)?;
-    let report = run_tests(&resolved, all)?;
+    let resolved = script.resolve_default(&script_dir)?;
+    let report = run_tests(&resolved, all, &labels)?;
     println!(
         "[ns-build] 测试: {} 通过, {} 失败, {} 跳过",
         report.passed, report.failed, report.skipped
@@ -201,6 +316,7 @@ fn cmd_test(args: &[String]) -> Result<(), String> {
 
 fn cmd_install(args: &[String]) -> Result<(), String> {
     let mut prefix: Option<PathBuf> = None;
+    let mut build_args = vec!["--quiet".to_string()];
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -208,8 +324,28 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
                 i += 1;
                 prefix = Some(PathBuf::from(args.get(i).ok_or("--prefix 需要参数")?));
             }
+            "-j" | "--jobs" | "--parallel" => {
+                i += 1;
+                let v = args.get(i).ok_or("选项后需要并行数参数")?;
+                build_args.push("-j".into());
+                build_args.push(v.clone());
+            }
+            t if parse_jobs_arg(t).is_some() => {
+                build_args.push(t.to_string());
+            }
+            "--profile" => {
+                i += 1;
+                build_args.push("--profile".into());
+                build_args.push(args.get(i).ok_or("--profile 需要参数")?.clone());
+            }
+            "--release" | "--debug" => build_args.push(args[i].clone()),
+            t if t.starts_with("--define") => build_args.push(t.to_string()),
+            "--verbose" | "-v" => {
+                build_args.push("--verbose".into());
+                build_args.retain(|a| a != "--quiet");
+            }
             "-h" | "--help" => {
-                println!("用法: ns-build install [--prefix <路径>]");
+                println!("用法: ns-build install [--prefix <路径>] [-j N] [--release|--debug] [--define name=value]");
                 return Ok(());
             }
             other => return Err(format!("未知选项 '{other}'")),
@@ -217,8 +353,10 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
+    // 先构建，再安装。
+    cmd_build(&build_args)?;
     let (script, script_dir) = load(&dir)?;
-    let resolved = script.resolve(&script_dir)?;
+    let resolved = script.resolve_default(&script_dir)?;
     let prefix = prefix.unwrap_or_else(ns_build::install::default_prefix);
     let report: InstallReport = install_all(&resolved, &prefix)?;
     println!(
@@ -243,14 +381,16 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let target = target.ok_or("用法: ns-build run <目标> [-- 参数...]")?;
+    // 先构建（含依赖），再运行。
+    cmd_build(&[target.clone(), "--quiet".to_string()])?;
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
-    let resolved = script.resolve(&script_dir)?;
+    let resolved = script.resolve_default(&script_dir)?;
     let Some(path) = find_exe(&resolved, &target) else {
         return Err(format!("找不到可执行目标 '{target}'"));
     };
     if !path.exists() {
-        return Err(format!("目标 '{target}' 未构建，请先运行 ns-build build"));
+        return Err(format!("目标 '{target}' 未构建成功"));
     }
     let status = run_one(path, &run_args)?;
     if !status.success() {
@@ -262,7 +402,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 fn cmd_show() -> Result<(), String> {
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
-    let resolved = script.resolve(&script_dir)?;
+    let resolved = script.resolve_default(&script_dir)?;
     println!("project: {} {}", resolved.script.project.name, resolved.script.project.version);
     println!("out: {}", resolved.out_dir.display());
     println!("parallel: {}", resolved.parallel);
@@ -282,7 +422,7 @@ fn cmd_show() -> Result<(), String> {
 fn cmd_graph() -> Result<(), String> {
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
-    let resolved = script.resolve(&script_dir)?;
+    let resolved = script.resolve_default(&script_dir)?;
     let cache = Cache::load(&resolved.cache_dir)?;
     let p = plan(&resolved, &cache)?;
     println!("digraph ns_build {{");
@@ -331,17 +471,20 @@ cc = "cc"
 cxx = "c++"
 ar = "ar"
 warnings = true
+unity = "auto"
 
 [[targets]]
 name = "{name}"
 kind = "exe"
-sources = ["src/**/*.c"]
+sources = ["**/*.c"]
 link = []
 "#
     );
     std::fs::create_dir_all(dir.join("src")).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("src/main.c"), "#include <stdio.h>\nint main(void) {\n    printf(\"hello from {name}\\n\");\n    return 0;\n}\n")
-        .map_err(|e| e.to_string())?;
+    let main_c = format!(
+        "#include <stdio.h>\nint main(void) {{\n    printf(\"hello from {name}\\n\");\n    return 0;\n}}\n"
+    );
+    std::fs::write(dir.join("src/main.c"), main_c).map_err(|e| e.to_string())?;
     std::fs::write(&file, tmpl).map_err(|e| format!("写入 ns-build.toml 失败: {e}"))?;
     println!("[ns-build] 初始化完成: {}", file.display());
     Ok(())
@@ -354,5 +497,43 @@ fn kind_str(k: ns_build::TargetKind) -> &'static str {
         ns_build::TargetKind::Static => "static",
         ns_build::TargetKind::Object => "object",
         ns_build::TargetKind::Phony => "phony",
+        ns_build::TargetKind::Module => "module",
+        ns_build::TargetKind::Interface => "interface",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jobs_arg_forms() {
+        assert_eq!(parse_jobs_arg("-j4"), Some(4));
+        assert_eq!(parse_jobs_arg("-j8"), Some(8));
+        assert_eq!(parse_jobs_arg("-j100"), Some(100));
+        assert_eq!(parse_jobs_arg("--jobs=8"), Some(8));
+        assert_eq!(parse_jobs_arg("--parallel=4"), Some(4));
+        assert_eq!(parse_jobs_arg("-j"), None);
+        assert_eq!(parse_jobs_arg("-jabc"), None);
+        assert_eq!(parse_jobs_arg("--jobs"), None);
+        assert_eq!(parse_jobs_arg("build"), None);
+    }
+
+    #[test]
+    fn build_args_parses_jobs_forms() {
+        let ba = parse_build_args(&["-j4".into(), "app".into()]).unwrap();
+        assert_eq!(ba.jobs, Some(4));
+        assert_eq!(ba.targets, vec!["app".to_string()]);
+
+        let ba = parse_build_args(&["--jobs=16".into()]).unwrap();
+        assert_eq!(ba.jobs, Some(16));
+
+        let ba = parse_build_args(&["-j".into(), "8".into()]).unwrap();
+        assert_eq!(ba.jobs, Some(8));
+    }
+
+    #[test]
+    fn build_args_rejects_unknown() {
+        assert!(parse_build_args(&["--bogus".into()]).is_err());
     }
 }

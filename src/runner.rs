@@ -12,10 +12,63 @@ pub struct TestReport {
     pub skipped: usize,
 }
 
-/// 运行所有 kind = exe 且名含 `test`（或以 `--all` 运行时全部）的产物。
-pub fn run_tests(script: &ResolvedScript, all: bool) -> Result<TestReport, String> {
+/// 运行所有测试。`labels`：只运行带有指定标签之一的显式 `[[tests]]`
+///（空 = 全部显式测试；隐式"name 含 test 的 exe"目标仅在空时参与）。
+pub fn run_tests(script: &ResolvedScript, all: bool, labels: &[String]) -> Result<TestReport, String> {
     let mut report = TestReport::default();
+    // 显式注册的 `[[tests]]` 优先。
+    for ts in &script.script.tests {
+        if !labels.is_empty() && !ts.labels.iter().any(|l| labels.contains(l)) {
+            // 不匹配标签：不计入统计。
+            continue;
+        }
+        let path = script
+            .targets
+            .iter()
+            .find(|t| t.name == ts.target)
+            .map(|t| t.output.clone());
+        let Some(path) = path else {
+            report.failed += 1;
+            eprintln!("  [FAIL] {} 目标 {} 不存在", ts.name, ts.target);
+            continue;
+        };
+        if !path.exists() {
+            report.skipped += 1;
+            eprintln!("  [SKIP] {} 未构建", ts.name);
+            continue;
+        }
+        let mut cmd = std::process::Command::new(&path);
+        cmd.args(&ts.args);
+        if let Some(wd) = &ts.workdir {
+            cmd.current_dir(script.dir.join(wd));
+        }
+        let status = if let Some(tmo) = ts.timeout {
+            run_with_timeout(cmd, tmo)
+        } else {
+            match cmd.status() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("  [FAIL] {} 运行失败: {e}", ts.name);
+                    None
+                }
+            }
+        };
+        let Some(status) = status else {
+            report.failed += 1;
+            continue;
+        };
+        if status.success() || !ts.require_success {
+            report.passed += 1;
+            println!("  [PASS] {}", ts.name);
+        } else {
+            report.failed += 1;
+            eprintln!("  [FAIL] {} 退出码 {:?}", ts.name, status.code());
+        }
+    }
     for t in &script.targets {
+        if !labels.is_empty() {
+            break; // 指定标签时不跑隐式 exe 测试
+        }
         if t.kind != TargetKind::Exe {
             continue;
         }
@@ -46,6 +99,25 @@ pub fn run_tests(script: &ResolvedScript, all: bool) -> Result<TestReport, Strin
         }
     }
     Ok(report)
+}
+
+/// 运行命令并超时；超时返回 None（调用方计失败）。
+fn run_with_timeout(mut cmd: std::process::Command, secs: u64) -> Option<std::process::ExitStatus> {
+    use std::time::{Duration, Instant};
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) => return Some(status),
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 /// 查找可运行目标。

@@ -109,8 +109,8 @@ impl BuildGraph {
     pub fn topo_order(&self) -> Result<Vec<NodeId>, String> {
         let n = self.len();
         let mut indeg = vec![0usize; n];
-        for i in 0..n {
-            indeg[i] = self.deps[i].len();
+        for (indeg_i, deps) in indeg.iter_mut().zip(self.deps.iter()) {
+            *indeg_i = deps.len();
         }
         let mut queue: std::collections::VecDeque<NodeId> = (0..n)
             .filter(|&i| indeg[i] == 0)

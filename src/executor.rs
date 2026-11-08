@@ -70,12 +70,16 @@ pub fn execute(
     // 拓扑排序（校验无环）。
     let order = plan.graph.topo_order()?;
 
-    // 目标过滤：匹配 key 前缀（target 名）。
+    // 目标过滤：key 形如 `<kind>:<target>:<subtask>`，取第二段匹配目标名。
     let filter: Option<BTreeSet<String>> = opts.targets.as_ref().map(|ts| ts.iter().cloned().collect());
     let key_ok = |key: &str| -> bool {
         match &filter {
             None => true,
-            Some(set) => set.iter().any(|t| key == t || key.starts_with(&format!("{t}:"))),
+            Some(set) => key
+                .split(':')
+                .nth(1)
+                .map(|t| set.contains(t))
+                .unwrap_or(false),
         }
     };
 
@@ -106,7 +110,6 @@ pub fn execute(
         let running = running.clone();
         let quiet = opts.quiet;
         let verbose = opts.verbose;
-        let cwd = cwd;
         running.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
             if !node.cached {
@@ -175,9 +178,44 @@ pub fn execute(
         if pending == 0 {
             break;
         }
-        // 无运行任务且无就绪：死锁（应不会发生，拓扑已校验）。
+        // 无运行任务且无就绪：先尝试收一个已完成的结果（线程可能刚结束，
+        // result 尚在通道中），避免误判停滞。
         if running.load(Ordering::SeqCst) == 0 && ready.is_empty() {
-            return Err(format!("调度停滞：仍有 {pending} 个任务未执行"));
+            match rx.try_recv() {
+                Ok(result) => {
+                    done[result.id] = true;
+                    pending -= 1;
+                    if result.ok {
+                        let node = plan.graph.node(result.id);
+                        if !node.cached {
+                            if !node.output.as_os_str().is_empty() {
+                                let cmd_hash = hash_cmd(&node.command);
+                                let outs = vec![node.output.to_string_lossy().into_owned()];
+                                let rec_inputs = refresh_compile_inputs(node, &result.inputs);
+                                cache.record(node.key.clone(), &rec_inputs, cmd_hash, outs);
+                                // 产物变化 → 使所有依赖此产物的后继缓存失效。
+                                let rdeps: Vec<NodeId> =
+                                    plan.graph.rdeps_of(result.id).iter().copied().collect();
+                                for r in rdeps {
+                                    plan.graph.node_mut(r).cached = false;
+                                }
+                            }
+                            report.built += 1;
+                        }
+                    } else {
+                        failed.store(true, Ordering::SeqCst);
+                        report.failed += 1;
+                    }
+                    unlock_rdeps(result.id, &plan.graph, &mut indeg, &mut ready, &done);
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("任务通道关闭".to_string());
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    return Err(format!("调度停滞：仍有 {pending} 个任务未执行"));
+                }
+            }
         }
 
         // 等待一个结果。
@@ -188,21 +226,22 @@ pub fn execute(
             let node = plan.graph.node(result.id);
             let actually_built = !node.cached;
             if actually_built {
-                let cmd_hash = hash_cmd(&node.command);
-                let outs = if node.output.as_os_str().is_empty() {
-                    vec![]
-                } else {
-                    vec![node.output.to_string_lossy().into_owned()]
-                };
-                cache.record(node.key.clone(), &result.inputs, cmd_hash, outs);
-                report.built += 1;
-                // 输入变了 → 使所有依赖此产物的后继缓存失效。
-                let rdeps: Vec<NodeId> = plan.graph.rdeps_of(result.id).iter().copied().collect();
-                for r in rdeps {
-                    plan.graph.node_mut(r).cached = false;
+                if !node.output.as_os_str().is_empty() {
+                    let cmd_hash = hash_cmd(&node.command);
+                    let outs = vec![node.output.to_string_lossy().into_owned()];
+                    let rec_inputs = refresh_compile_inputs(node, &result.inputs);
+                    cache.record(node.key.clone(), &rec_inputs, cmd_hash, outs);
+                    // 输入变了 → 使所有依赖此产物的后继缓存失效。
+                    let rdeps: Vec<NodeId> = plan.graph.rdeps_of(result.id).iter().copied().collect();
+                    for r in rdeps {
+                        plan.graph.node_mut(r).cached = false;
+                    }
                 }
+                report.built += 1;
             }
         } else {
+            failed.store(true, Ordering::SeqCst);
+            report.failed += 1;
         }
         unlock_rdeps(result.id, &plan.graph, &mut indeg, &mut ready, &done);
     }
@@ -239,6 +278,10 @@ fn unlock_rdeps(
 
 /// 运行外部命令，打印 stdout/stderr。
 pub fn run_command(cmd: &[String], cwd: &Path) -> bool {
+    // 空命令（phony / interface / 空 object）视为成功。
+    if cmd.is_empty() {
+        return true;
+    }
     let mut c = Command::new(&cmd[0]);
     c.args(&cmd[1..]);
     c.current_dir(cwd);
@@ -258,6 +301,23 @@ pub fn run_command(cmd: &[String], cwd: &Path) -> bool {
             false
         }
     }
+}
+
+/// 编译任务成功后：用最新 .d 文件刷新缓存输入（源文件 + 头文件去重合并）。
+/// 这样下次构建时头文件变化能命中"输入哈希不一致"而被重编译。
+fn refresh_compile_inputs(node: &crate::graph::Node, base: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(d) = &node.depfile else {
+        return base.to_vec();
+    };
+    let mut v = base.to_vec();
+    if let Ok(deps) = crate::depfile::parse_depfile(d) {
+        for dep in deps {
+            if !v.iter().any(|x| x == &dep) {
+                v.push(dep);
+            }
+        }
+    }
+    v
 }
 
 #[cfg(test)]

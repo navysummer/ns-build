@@ -21,10 +21,11 @@ pub enum Os {
 impl Os {
     /// 当前运行的操作系统。
     pub fn current() -> Self {
-        Self::from_str(std::env::consts::OS)
+        Self::parse(std::env::consts::OS)
     }
 
-    pub fn from_str(s: &str) -> Self {
+    /// 从字符串解析（未知回退 Unknown）。
+    pub fn parse(s: &str) -> Self {
         match s {
             "linux" => Self::Linux,
             "macos" => Self::Macos,
@@ -103,10 +104,11 @@ pub enum Arch {
 impl Arch {
     /// 当前运行架构。
     pub fn current() -> Self {
-        Self::from_str(std::env::consts::ARCH)
+        Self::parse(std::env::consts::ARCH)
     }
 
-    pub fn from_str(s: &str) -> Self {
+    /// 从字符串解析（未知回退 Unknown）。
+    pub fn parse(s: &str) -> Self {
         match s {
             "x86_64" | "amd64" => Self::X86_64,
             "x86" | "i386" | "i686" => Self::X86,
@@ -175,8 +177,8 @@ mod tests {
 
     #[test]
     fn arch_aliases() {
-        assert_eq!(Arch::from_str("amd64"), Arch::X86_64);
-        assert_eq!(Arch::from_str("arm64"), Arch::Aarch64);
-        assert_eq!(Arch::from_str("i686"), Arch::X86);
+        assert_eq!(Arch::parse("amd64"), Arch::X86_64);
+        assert_eq!(Arch::parse("arm64"), Arch::Aarch64);
+        assert_eq!(Arch::parse("i686"), Arch::X86);
     }
 }
