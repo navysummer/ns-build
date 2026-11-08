@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (without v prefix)'
+        required: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  APP_NAME: ns-build
+
+jobs:
+  build:
+    name: Build (${{ matrix.os_name }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os_name: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os_name: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os_name: macos
+            arch: amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os_name: macos
+            arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os_name: windows
+            arch: amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os_name: windows
+            arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: matrix.os_name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          if [ -z "$VER" ] || [ "$VER" = "$GITHUB_REF_NAME" ]; then
+            VER="${{ github.event.inputs.version || '0.0.0' }}"
+          fi
+          STAGE="dist/${{ env.APP_NAME }}-${VER}-${{ matrix.os_name }}-${{ matrix.arch }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/${{ env.APP_NAME }}" "$STAGE/"
+          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+          tar -C dist -czf "dist/${{ env.APP_NAME }}-${VER}-${{ matrix.os_name }}-${{ matrix.arch }}.tar.gz" "$(basename "$STAGE")"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME -replace '^v',''
+          if ([string]::IsNullOrEmpty($ver) -or $ver -eq $env:GITHUB_REF_NAME) { $ver = "${{ github.event.inputs.version || '0.0.0' }}" }
+          $name = "${{ env.APP_NAME }}-$ver-${{ matrix.os_name }}-${{ matrix.arch }}"
+          $stage = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.APP_NAME }}.exe" "$stage/"
+          if (Test-Path README.md) { Copy-Item README.md "$stage/" }
+          if (Test-Path LICENSE) { Copy-Item LICENSE "$stage/" }
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$name.zip" -Force
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os_name }}-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "ns-build ${{ github.ref_name }}"
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/*.zip
+          draft: true
+          prerelease: false

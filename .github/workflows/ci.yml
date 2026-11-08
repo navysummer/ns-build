@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os_name }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os_name: linux
+            arch: amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            test: full
+          - os_name: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            test: full
+          - os_name: macos
+            arch: amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            test: full
+          - os_name: macos
+            arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            test: full
+          - os_name: windows
+            arch: amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            test: unit
+          - os_name: windows
+            arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            test: unit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: matrix.os_name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
+
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+
+      - name: Build
+        shell: bash
+        run: cargo build --all-targets --target ${{ matrix.target }}
+
+      - name: Test (full)
+        if: matrix.test == 'full'
+        shell: bash
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Test (unit/bin only)
+        if: matrix.test == 'unit'
+        shell: bash
+        run: cargo test --lib --bins --target ${{ matrix.target }}
