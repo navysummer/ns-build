@@ -106,21 +106,25 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 | 头文件安装 | `[[install_headers]]` glob 规则 |
 | 通用文件安装 | `[[install_files]]`（对应 `install(FILES/DIRECTORY)`，可排除） |
 | 编译标准 | `c_std` / `cxx_std` 覆盖默认 `-std` |
-| 预编译头 | `pch`（`-include`，对应 `target_precompile_headers`） |
+| 预编译头 | `pch`（`-include` / `/FI`，支持多个头，对应 `target_precompile_headers`） |
 | 测试注册 | `[[tests]]`（含 `timeout`/`labels`，对应 `add_test`） |
 | pkg-config | `pkg_config = ["openssl"]` 展开 `--cflags`（编译）与 `--libs`（链接） |
+| 编译器检测 | `[[checks]]` try-compile+link，结果注入 `${var}` 与 `-D` 宏（对应 `check_cxx_compiler_flag`） |
+| 警告即错误 | `werror`（target/defaults → `-Werror` / `/WX`） |
 | 构建配置 | `--release`/`--debug`/`--profile`（4 种：Release/Debug/RelWithDebInfo/MinSizeRel） |
 | 跨平台 | OS/架构检测，`os`/`arch` 平台过滤 |
 | 交叉工具链 | `[[toolchains]]`，可用 `target.toolchain` / `defaults.toolchain` 选择 |
 | 产物命名 | 按目标平台命名：`app.exe` / `libfoo.dylib` / `libfoo.so` / `foo.dll` / `libfoo.a` |
-| 依赖使用传播 | 依赖目标的 `include_dirs`/`defines`/`link` 等使用要求**传递性**传播到下游 |
-| 静态/动态库链接 | `deps` 直接静态/动态库产物并链接；静态库链式依赖自动递归收集 |
-| 动态库运行 | 链接构建树内 `.so`/`.dylib` 时自动写入 `-Wl,-rpath`，未安装也可直接运行 |
+| 依赖使用传播 | `deps` 的 `include_dirs`/`defines`/`link` 等使用要求**传递性**传播；`private_deps` 仅本级使用（CMake PRIVATE） |
+| 静态/动态库链接 | `deps` 直接静态/动态库产物并链接；静态库链式依赖自动递归收集（含 private_deps） |
+| 动态库运行 | 链接构建树内 `.so`/`.dylib` 时自动写入 `-Wl,-rpath`；target `rpath` 可嵌入 `$ORIGIN`（安装后可定位 prefix/lib） |
+| 库版本/SONAME | `soversion = "1"` → `libfoo.so.1` / `libfoo.1.dylib` + 开发者符号链接（soname / install_name） |
 | 产物类型 | `exe` / `lib` / `module` / `static` / `object` / `interface` / `phony` |
 | 钩子 | `hooks.before`/`hooks.after` 构建前后自定义命令 |
 | 目标过滤 | `ns-build build <target>` 只构建指定目标（含传递依赖） |
 | 生成代码管线 | `[[custom_commands]]`（产物 + 依赖 + 增量，等价 `add_custom_command(OUTPUT)`） |
-| 安装导出 | `[[exports]]` 写入 `<name>-config.toml`；`[[imports]]` 读回并链接（`install(EXPORT)` / `find_package` 等价） |
+| 安装导出 | `[[exports]]` 写入 `<name>-config.toml`（可选 `pc = true` 生成 relocatable `.pc`）；`[[imports]]` 读回并链接（`install(EXPORT)` / `find_package` 等价） |
+| 打包 | `ns-build package`（install → staging → `tar.gz`/`zip`，CPack 简化版） |
 | 构建预设 | `[presets]` + `--preset` / `ns-build presets`（对应 `cmake --preset`） |
 | 外部依赖 | `[[fetch]]` + `ns-build fetch`（git / url，`FetchContent` 等价，支持 file:// 离线） |
 | MSVC 工具链 | `cl` / `clang-cl` 命令生成（未在真实 MSVC SDK 本机验证） |
@@ -135,12 +139,20 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 | `add_library` (MODULE) | `kind = "module"` | ✅ |
 | `add_library` (OBJECT) | `kind = "object"` | ✅ |
 | `add_library` (INTERFACE) | `kind = "interface"`（头文件库） | ✅ |
+| `target_link_libraries(PRIVATE/PUBLIC)` | `private_deps`（PRIVATE）/ `deps`（PUBLIC） | ✅ |
 | `target_link_libraries` | `deps` + `link` | ✅ |
 | `target_include_directories` | `include_dirs` | ✅ |
 | `target_compile_definitions` | `defines` | ✅ |
 | `target_compile_options` | `flags` / `cflags` / `cxxflags` | ✅ |
+| `target_compile_options`（警告） | `warnings = true`（`-Wall -Wextra`）/ `warnings = false` | ✅ |
+| `target_compile_options`（as error） | `werror = true`（`-Werror` / `/WX`） | ✅ |
 | `target_compile_features` | `c_std` / `cxx_std` | ✅ |
-| `target_precompile_headers` | `pch`（`-include`） | ✅ |
+| `target_precompile_headers` | `pch`（字符串或数组，`-include` / `/FI`） | ✅ |
+| `check_cxx_compiler_flag` / `CHECK_INCLUDE_FILE` | `[[checks]]` try-compile + 磁盘缓存 | ✅ |
+| `SOVERSION` | `soversion = "1"`（soname / install_name + 开发者符号链接） | ✅ |
+| `BUILD_RPATH` / `INSTALL_RPATH` | `rpath = [...]`（含 `$ORIGIN`） | ✅ |
+| `install(EXPORT)` / `find_package`（含 `.pc`） | `[[exports]]` / `[[imports]]`（TOML 配置；`pc = true` 生成 relocatable `.pc`） | ✅ |
+| `CPack` | `ns-build package`（staging + `.tar.gz`/`.zip`） | ✅ |
 | `add_dependencies` | `deps`（顺序依赖） | ✅ |
 | `add_custom_command` | `[[custom_commands]]`（产物追踪 + 增量 + 链式构建） | ✅ |
 | `install(EXPORT)` / `find_package` | `[[exports]]` / `[[imports]]`（TOML 配置） | ✅ |
@@ -194,8 +206,8 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 ## 开发
 
 ```bash
-cargo test --lib          # 单元测试（53 个：解析/depfile/缓存/图/调度/编译器/导出配置）
-cargo test --test e2e     # 端到端（20 个：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置/init/生成代码/预设/导出导入/fetch）
+cargo test --lib          # 单元测试（58 个：解析/depfile/缓存/图/调度/编译器/导出配置/检测）
+cargo test --test e2e     # 端到端（24 个：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置/init/生成代码/预设/导出导入/fetch/checks/soversion/package）
 cargo test --test languages  # 多语言（C++ unity 推断等）
 cargo test --test perf    # 性能（300 文件全量 vs 增量）
 ./scripts/bench.sh        # 与 CMake+Ninja 对比基准

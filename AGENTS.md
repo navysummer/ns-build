@@ -16,6 +16,8 @@
 - **生成代码管线**：`[[custom_commands]]` 产物可作为源，自动建 DAG 边 + 增量追踪（CMake `add_custom_command(OUTPUT)`）。
 - **包导出/导入**：`[[exports]]` 写 `<name>-config.toml`，`[[imports]]` 全局并入（`install(EXPORT)` / `find_package`）。
 - **构建预设**：`[presets]` + `--preset`（`cmake --preset`）；**外部依赖**：`[[fetch]]` + `ns-build fetch`（`FetchContent`）。
+- **依赖粒度**：`private_deps` 参与编译/链接但不重导出（CMake PRIVATE）；**特性检测**：`[[checks]]` try-compile 缓存注入变量（`check_cxx_compiler_flag`）。
+- **库版本**：`soversion`（soname/install_name + 开发者符号链接）；**打包**：`ns-build package`（`.tar.gz`/`.zip`）。
 
 ## 构建脚本（`ns-build.toml`）格式
 
@@ -41,6 +43,7 @@ parallel = 0          # 0 = CPU 核数
 unity = "auto"        # off | on | auto（auto = ≥4 源自动分组，组数≈n/4，封顶并行度）
 strip = false
 warnings = true
+werror = false        # 可选：警告即错误（-Werror / /WX）
 toolchain = "mingw"   # 可选：默认工具链名；targets 可逐个覆盖
 cache = ".ns-cache"   # 增量缓存目录
 
@@ -59,7 +62,10 @@ link_dirs = []
 link_flags = []
 defines = []
 deps = ["core"]       # object 库对象并入；静态/动态库产物直接链接，静态链式依赖递归收集
+private_deps = ["implib"]   # 私有依赖：参与编译/链接但不重导出给下游（CMake PRIVATE）
 output = "app"        # 产物名（默认 target 名 + 平台后缀：.exe / lib*.so|.dylib|.dll / lib*.a）
+soversion = "1"       # 可选：动态库 → lib*.so.1 + soname / lib*.1.dylib + @rpath（unix）
+rpath = ["$ORIGIN/../lib"]   # 可选：写入 -Wl,-rpath，支持 $ORIGIN 与绝对路径
 groups = 2            # unity 分组数（每组合并编译一个 .o）
 group_size = 4        # 每组源文件数（与 groups 二选一）
 parallel = true       # 是否参与并行
@@ -121,6 +127,7 @@ ns-build show
 ns-build graph        # 输出 DOT 依赖图
 ns-build presets      # 列出 [presets] 预设
 ns-build fetch [--update]  # 拉取 [[fetch]] 外部依赖
+ns-build package [--format tar.gz|zip]  # install 到 staging 并打包
 ns-build init [--name <名>]
 ```
 
@@ -147,7 +154,7 @@ src/
 ### 数据流
 
 1. `load(dir)` → 读 `ns-build.toml`，`BuildScript::parse` 反序列化。
-2. `BuildScript::resolve(dir)` → `ResolvedScript`：imports 合并 → 自定义命令两遍解析（先收集 outputs 再解析 depends/command）→ include 子脚本合并（父级 outputs 作为继承存在性检查）→ targets 解析（glob 展开、平台过滤，INTERFACE 使用要求由 propagate_usage 全局传递）。
+2. `BuildScript::resolve(dir)` → `ResolvedScript`：imports 合并 → `[[checks]]` try-compile（磁盘缓存注入 `${var}` 与全局 -D）→ 自定义命令两遍解析（先收集 outputs 再解析 depends/command）→ include 子脚本合并（父级 outputs 作为继承存在性检查）→ targets 解析（glob 展开、平台过滤）；依赖使用要求由 propagate_usage 全局传播（`deps` PUBLIC 重导出 / `private_deps` 仅本级）。
 3. `planner::plan(script, cache)` → `Plan { graph, outputs, skipped }`：
    - 第零遍：`[[custom_commands]]` 生成命令节点（`custom:<name>` 键，缓存按 depends 内容哈希，outputs 全在才缓存命中），再按 `deps` 连成自身 DAG。
    - 第一遍：每个非 phony/interface target 生成对象编译节点（unity 分组）；引用自定义产物的 chunk/源，自动挂依赖边到对应 GEN 节点。
@@ -170,14 +177,14 @@ src/
 ## 测试
 
 ```bash
-cargo test --lib      # 单元测试（53：解析/depfile/缓存/图/调度/编译器/脚本规范化/导出配置）
-cargo test --test e2e # 端到端（20：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置覆盖/init/生成代码/预设/导出导入/fetch）
+cargo test --lib      # 单元测试（58：解析/depfile/缓存/图/调度/编译器/脚本规范化/导出配置/soversion）
+cargo test --test e2e # 端到端（24：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置/init/生成代码/预设/导出导入/fetch/checks/package）
 cargo test --test languages # 多语言 e2e（8：含 C++ unity 与 C++ 推断）
 cargo test --test perf # 性能：300 文件全量 vs 增量（增量应显著更快）
 ./scripts/bench.sh    # 与 CMake + Ninja 对比基准（NS_BENCH_N 可调规模）
 ```
 
-**当前全部绿**：53 lib + 3 main(CLI) + 20 e2e + 8 languages + 1 perf = **85 个测试，0 警告 0 错误**（不使用 `#[allow]`/`#[warn]` 等抑制手段；`cargo clippy --all-targets` 亦零警告）。
+**当前全部绿**：58 lib + 3 main(CLI) + 24 e2e + 8 languages + 1 perf = **94 个测试，0 警告 0 错误**（不使用 `#[allow]`/`#[warn]` 等抑制手段；`cargo clippy --all-targets` 亦零警告）。
 
 **性能对比**（300 文件 C 项目，macOS 12 核 clang 17，`scripts/bench.sh`）：
 
@@ -197,6 +204,9 @@ ns-build 默认 unity 自动分组，比 CMake 快约 12×；逐文件模式与 
 - `pkg-config` 查询失败时按无该依赖处理（不展开 `-I`/`-l`），不阻塞构建。
 - `install` 会构建所有目标（不限于安装产物）；`[[exports]]` 只写配置，不自动安装头文件（头文件走 `[[install_headers]]`）。
 - 导入包的使用要求是**全局**的（如同全局 find_package），无 target 级作用域；导入链接顺序按配置声明顺序追加。
+- `soversion` 仅 unix 流派（Linux `.so.N` + soname、macOS `.N.dylib` + `@rpath` install_name）；Windows 忽略。
+- `ns-build package` 需要 bsdtar（macOS/Windows 自带）或 GNU tar / zip；zip 不支持 `strip_components`。
+- `[[checks]]` 结果按（编译器+源+宏+库）键缓存于 `.ns-cache/checks.json`；改任一输入即重新检测。
 
 ## 编码约定
 

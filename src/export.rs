@@ -140,6 +140,64 @@ fn prefix_for_config_path(f: &Path) -> PathBuf {
     parent.to_path_buf()
 }
 
+/// 从目标产物文件名推出 pkg-config 的 `-l` 名：`libfoo.a` / `libfoo.so(.N)` / `libfoo.dylib` → `foo`。
+pub fn pc_lib_name(output: &str) -> Option<String> {
+    let stem = output.strip_prefix("lib").unwrap_or(output);
+    for suf in [".so", ".a", ".dylib", ".lib"] {
+        if let Some(i) = stem.find(suf) {
+            let name = &stem[..i];
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 生成 relocatable 的 pkg-config `.pc` 内容（prefix = ${pcfiledir}/../..）。
+pub fn render_pc_file(
+    name: &str,
+    description: &str,
+    version: &str,
+    libs: &[String],
+    libs_private: &[String],
+) -> String {
+    let libs_flag = libs
+        .iter()
+        .map(|l| format!("-l{l}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let private_flag = libs_private.join(" ");
+    format!(
+        "prefix=${{pcfiledir}}/../..\n\
+         exec_prefix=${{prefix}}\n\
+         libdir=${{exec_prefix}}/lib\n\
+         includedir=${{prefix}}/include\n\
+         \n\
+         Name: {name}\n\
+         Description: {description}\n\
+         Version: {version}\n\
+         Libs: -L${{libdir}} {libs_flag}\n\
+         Libs.private: {private_flag}\n\
+         Cflags: -I${{includedir}}\n"
+    )
+}
+
+/// pkg-config 的 Libs.private 行：裸库名 → `-lname`，其余原样保留。
+pub fn pc_private_lib(l: &str) -> String {
+    if l.contains('/')
+        || l.contains('\\')
+        || l.starts_with('-')
+        || [".so", ".a", ".dylib", ".lib", ".dll"]
+            .iter()
+            .any(|s| l.to_lowercase().ends_with(s))
+    {
+        l.to_string()
+    } else {
+        format!("-l{l}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

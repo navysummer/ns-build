@@ -181,6 +181,7 @@ pub struct Defaults {
     pub toolchain: Option<String>,
     pub strip: bool,
     pub warnings: bool,
+    pub werror: bool,
     pub cache: String,
     /// 变量表：`${name}` 在脚本字符串中替换。
     pub variables: BTreeMap<String, String>,
@@ -204,6 +205,7 @@ impl Default for Defaults {
             toolchain: None,
             strip: false,
             warnings: true,
+            werror: false,
             cache: ".ns-cache".into(),
             variables: BTreeMap::new(),
         }
@@ -256,8 +258,10 @@ pub struct Target {
     pub link_flags: Vec<String>,
     /// 宏定义（`-D`）。
     pub defines: Vec<String>,
-    /// 依赖的其他 target 名。
+    /// 依赖的其他 target 名（其使用要求向下游传播；CMake PUBLIC/INTERFACE）。
     pub deps: Vec<String>,
+    /// 私有依赖：参与编译与链接，但使用要求**不**向下游传播（CMake PRIVATE）。
+    pub private_deps: Vec<String>,
     /// pkg-config 包名：链接时展开 `pkg-config --libs`。
     pub pkg_config: Vec<String>,
     /// 产物名（相对 out 目录）；默认按 target 名 + 平台后缀。
@@ -276,6 +280,14 @@ pub struct Target {
     pub arch: Vec<String>,
     pub profile: Option<Profile>,
     pub strip: Option<bool>,
+    /// 动态库的 soversion（如 `"1"`）：Linux `libfoo.so.1` + soname、macOS `libfoo.1.dylib` + install_name。
+    /// 并在 out 与 install 前缀下创建 `libfoo.so`/`libfoo.dylib` 开发者符号链接。Windows 忽略。
+    pub soversion: Option<String>,
+    /// 链接时写入的运行时库搜索路径（`-Wl,-rpath`）；支持 `$ORIGIN`/`${var}` 与相对路径。
+    /// Windows 下忽略（无 rpath 概念）。
+    pub rpath: Vec<String>,
+    /// 警告即错误（-Werror / /WX）；默认取 defaults.werror。
+    pub werror: Option<bool>,
     /// 产物是否安装（供 `install` 用）；默认 true。
     pub install: Option<bool>,
     /// 条件构建表达式（`when`）：如 `os == "linux" && arch == "x86_64"`.
@@ -285,9 +297,51 @@ pub struct Target {
     /// C++ 标准，如 `c++17` / `c++20`.
     pub cxx_std: Option<String>,
     /// 预编译头（`-include`，对应 CMake `target_precompile_headers`）。
-    pub pch: Option<String>,
-
+    /// 支持单个字符串或字符串数组。
+    pub pch: Option<PchValue>,
 }
+/// 预编译头字段的值：单个头文件或头文件列表。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PchValue {
+    /// `pch = "include/pre.h"`
+    One(String),
+    /// `pch = ["a.h", "b.h"]`
+    Many(Vec<String>),
+}
+
+impl PchValue {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(s) => vec![s],
+            Self::Many(v) => v,
+        }
+    }
+}
+
+/// 编译器特性检测（CMake `check_cxx_compiler_flag` / `CHECK_INCLUDE_FILE` 等价）：
+/// 解析期做一次 try-compile+link，结果注入 `${name}` 变量（1/0）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Check {
+    /// 名字（同时用作 `${name}` 变量名）。
+    pub name: String,
+    /// 内联源码（与 `source_file` 二选一）。
+    pub source: Option<String>,
+    /// 外部源文件（相对脚本目录；与 `source` 二选一）。
+    pub source_file: Option<String>,
+    /// `c` | `cxx`（默认 `cxx`）。
+    pub kind: String,
+    /// 检测时额外的宏定义（-D/-U）。
+    pub defines: Vec<String>,
+    /// 检测时链接的库（-l）。
+    pub libraries: Vec<String>,
+    /// 成功时注入所有 target 的 `-D<define>=1`。
+    pub define: Option<String>,
+    /// true → 检测失败直接报错（默认 false，仅为 0）。
+    pub fail_fatal: bool,
+}
+
 /// 自定义命令（CMake `add_custom_command(OUTPUT)` 等价）：
 /// 生成文件，供 targets 作为源/输入使用；生命周期与缓存接入与普通任务一致。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -353,6 +407,8 @@ pub struct Export {
     pub to: String,
     /// 包版本；默认 `project.version`。
     pub version: String,
+    /// true：同时生成 `lib/pkgconfig/<name>.pc`（pkg-config，prefix 可 relocatable）。
+    pub pc: bool,
 }
 
 /// 导入已安装的包（CMake `find_package` 等价）：其使用要求并入所有目标。
@@ -410,6 +466,8 @@ pub struct BuildScript {
     pub includes: Vec<String>,
     /// 自定义命令（`[[custom_commands]]`）。
     pub custom_commands: Vec<CustomCommand>,
+    /// 编译器特性检测（`[[checks]]`），解析期执行一次，结果缓存。
+    pub checks: Vec<Check>,
     /// 安装导出（`[[exports]]`）。
     pub exports: Vec<Export>,
     /// 导入已安装的包（`[[imports]]`）。
@@ -472,6 +530,7 @@ pub struct ResolvedTarget {
     pub link_flags: Vec<String>,
     pub defines: Vec<String>,
     pub deps: Vec<String>,
+    pub private_deps: Vec<String>,
     pub output: PathBuf,
     pub groups: Option<usize>,
     pub group_size: Option<usize>,
@@ -480,12 +539,17 @@ pub struct ResolvedTarget {
     pub profile: Profile,
     pub strip: bool,
     pub warnings: bool,
+    pub werror: bool,
+    /// 已规范化的 rpath 目录（绝对路径或 $ORIGIN 模板，原样传递）。
+    pub rpath: Vec<String>,
+    /// 动态库 soversion（unix 有效；决定输出文件名与 soname/install_name）。
+    pub soversion: Option<String>,
     pub install: bool,
     pub c_std: Option<String>,
     pub cxx_std: Option<String>,
     pub pkg_config: Vec<String>,
     pub when: Option<String>,
-    pub pch: Option<String>,
+    pub pch: Vec<String>,
 }
 
 /// 自定义命令解析结果（路径已绝对化、glob 已展开、命令已做变量替换）。
@@ -634,6 +698,18 @@ impl BuildScript {
                 }
             }
         }
+
+        // [[checks]]：编译器特性检测（try-compile+link）。结果缓存 in <cache_dir>/checks.json；
+        // 成功时把 `${name}` 置 "1"（否则 "0"），并按 `define` 注入全局 -D<define>=1。
+        run_checks(
+            &self.checks,
+            &self.defaults,
+            &dir,
+            &out_dir,
+            &cache_dir,
+            &mut vars,
+            &mut import_defines,
+        )?;
 
         // 自定义命令：第一遍只收集 outputs（含父脚本继承的），
         // 第二遍解析 depends/命令（这样 depends 可以引用任意顺序声明的产物）。
@@ -1046,18 +1122,41 @@ impl BuildScript {
             .or(self.defaults.profile)
             .unwrap_or_default();
         let strip = t.strip.unwrap_or(self.defaults.strip);
+        // rpath：$ORIGIN 模板/绝对路径原样保留；其余相对路径相对脚本目录解析。
+        let rpath: Vec<String> = t
+            .rpath
+            .iter()
+            .map(|s| sub(s))
+            .map(|s| {
+                let p = Path::new(&s);
+                if p.is_absolute() || s.contains("$ORIGIN") || s.contains("${ORIGIN}") {
+                    s
+                } else {
+                    dir.join(&s).to_string_lossy().into_owned()
+                }
+            })
+            .collect();
         let base_output = sub(t.output.as_deref().unwrap_or(&t.name));
         let output = if t.output.is_some() {
             // 显式 output 完全按用户写法处理。
             base_output
         } else {
+            // soversion（非 Windows）改变动态库文件名：libfoo.so.N / libfoo.N.dylib。
+            let sv = t
+                .soversion
+                .as_deref()
+                .filter(|v| !v.trim().is_empty())
+                .filter(|_| !target_host.os.is_windows_family());
             match t.kind {
                 TargetKind::Exe
                     if !matches!(language, Language::Python | Language::Shell | Language::Java) =>
                 {
                     format!("{}{}", base_output, target_host.os.exe_suffix())
                 }
-                TargetKind::Lib | TargetKind::Module => target_host.os.dylib_name(&base_output),
+                TargetKind::Lib | TargetKind::Module => match sv {
+                    Some(v) => target_host.os.dylib_name_versioned(&base_output, v),
+                    None => target_host.os.dylib_name(&base_output),
+                },
                 TargetKind::Static => target_host.os.static_name(&base_output),
                 _ => base_output,
             }
@@ -1096,6 +1195,7 @@ impl BuildScript {
             link_flags,
             defines,
             deps: t.deps.clone(),
+            private_deps: t.private_deps.clone(),
             output: out_dir.join(output),
             groups: t.groups,
             group_size: t.group_size,
@@ -1103,13 +1203,27 @@ impl BuildScript {
             hooks: resolve_hooks(&t.hooks, &sub),
             profile,
             strip,
+            rpath,
+            soversion: t
+                .soversion
+                .as_deref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             warnings: self.defaults.warnings,
+            werror: t.werror.unwrap_or(self.defaults.werror),
             install: t.install.unwrap_or(true),
             c_std: t.c_std.clone(),
             cxx_std: t.cxx_std.clone(),
             pkg_config,
             when: t.when.clone(),
-            pch: t.pch.as_ref().map(|p| sub(p)),
+            pch: t
+                .pch
+                .clone()
+                .map(PchValue::into_vec)
+                .unwrap_or_default()
+                .iter()
+                .map(|p| sub(p))
+                .collect(),
         }))
     }
 }
@@ -1148,8 +1262,46 @@ fn pkg_config_flags(pkg: &str, flag: &str) -> Vec<String> {
     }
 }
 
-/// 传递依赖目标的公开使用要求（include_dirs / defines / link / link_dirs / link_flags）。
-/// 目标本身显式声明的项优先，重复项只保留一次。
+/// 目标的公开导出集：向下游（包括经由 public deps）重导出的使用要求。
+/// 目标本身声明的是 public 的；private_deps 的导出集只并入**本级编译**，
+/// 不再向下游重导出（CMake PRIVATE 语义）。
+#[derive(Clone, PartialEq)]
+struct ExportSet {
+    include_dirs: Vec<PathBuf>,
+    defines: Vec<String>,
+    link: Vec<String>,
+    link_dirs: Vec<PathBuf>,
+    link_flags: Vec<String>,
+    pkg_config: Vec<String>,
+}
+
+impl ExportSet {
+    fn of(t: &ResolvedTarget) -> Self {
+        Self {
+            include_dirs: t.include_dirs.clone(),
+            defines: t.defines.clone(),
+            link: t.link.clone(),
+            link_dirs: t.link_dirs.clone(),
+            link_flags: t.link_flags.clone(),
+            pkg_config: t.pkg_config.clone(),
+        }
+    }
+
+    /// 并入 `src`，返回是否有变化。
+    fn merge(&mut self, src: &ExportSet) -> bool {
+        let mut changed = false;
+        changed |= merge_unique(&mut self.include_dirs, &src.include_dirs);
+        changed |= merge_unique(&mut self.defines, &src.defines);
+        changed |= merge_unique(&mut self.link, &src.link);
+        changed |= merge_unique(&mut self.link_dirs, &src.link_dirs);
+        changed |= merge_unique(&mut self.link_flags, &src.link_flags);
+        changed |= merge_unique(&mut self.pkg_config, &src.pkg_config);
+        changed
+    }
+}
+
+/// 传递依赖目标的公开使用要求（include_dirs / defines / link / link_dirs / link_flags / pkg_config）。
+/// `deps` 重导出（PUBLIC），`private_deps` 仅提供给本级编译与链接，不外传。
 fn propagate_usage(targets: &mut [ResolvedTarget]) -> Result<(), String> {
     let mut index: BTreeMap<String, usize> = BTreeMap::new();
     for (i, t) in targets.iter().enumerate() {
@@ -1157,33 +1309,66 @@ fn propagate_usage(targets: &mut [ResolvedTarget]) -> Result<(), String> {
             return Err(format!("target 名重复: '{}'", t.name));
         }
     }
+    let kinds: Vec<TargetKind> = targets.iter().map(|t| t.kind).collect();
+    // 依赖存在性/自指校验（public 与 private 都检查）。
+    for t in targets.iter() {
+        for dep in t.deps.iter().chain(t.private_deps.iter()) {
+            if !index.contains_key(dep) {
+                return Err(format!("target '{}' 依赖不存在的 target '{}'", t.name, dep));
+            }
+            if dep == &t.name {
+                return Err(format!("target '{}' 依赖自身", t.name));
+            }
+        }
+    }
+    // 编译集 = 目标（原地累积，初始为目标自身声明集之外的 defaults/工具链合并结果）。
+    // 导出集 = 自身声明集 + public 依赖的导出集（private 不参与重导出）。
+    let self_sets: Vec<ExportSet> = targets.iter().map(ExportSet::of).collect();
+    let mut exports: Vec<ExportSet> = self_sets.clone();
     // 最多迭代 N 轮，覆盖任意深度的依赖链。
     for _ in 0..targets.len().max(1) {
-        let snapshot = targets.to_vec();
+        let snapshot = exports.clone();
         let mut changed = false;
         for (i, target) in targets.iter_mut().enumerate() {
-            let deps = target.deps.clone();
-            for dep in deps {
-                let Some(&j) = index.get(&dep) else {
-                    return Err(format!(
-                        "target '{}' 依赖不存在的 target '{}'",
-                        target.name, dep
-                    ));
-                };
-                if i == j {
+            let mut exp_new = self_sets[i].clone();
+            // public 依赖（deps）：
+            // - 其导出集并入本级编译集；
+            // - 其导出集也并入本级导出集（向下游重导出）。
+            for dep in &target.deps {
+                let &j = index.get(dep).expect("dep 存在性已校验");
+                if j == i {
                     continue;
                 }
-                let src = &snapshot[j];
-                // 可执行文件/phony 不作为库传播使用要求。
-                if matches!(src.kind, TargetKind::Exe | TargetKind::Phony) {
+                if matches!(kinds[j], TargetKind::Exe | TargetKind::Phony) {
                     continue;
                 }
-                changed |= merge_unique(&mut target.include_dirs, &src.include_dirs);
-                changed |= merge_unique(&mut target.defines, &src.defines);
-                changed |= merge_unique(&mut target.link, &src.link);
-                changed |= merge_unique(&mut target.link_dirs, &src.link_dirs);
-                changed |= merge_unique(&mut target.link_flags, &src.link_flags);
-                changed |= merge_unique(&mut target.pkg_config, &src.pkg_config);
+                changed |= merge_unique(&mut target.include_dirs, &snapshot[j].include_dirs);
+                changed |= merge_unique(&mut target.defines, &snapshot[j].defines);
+                changed |= merge_unique(&mut target.link, &snapshot[j].link);
+                changed |= merge_unique(&mut target.link_dirs, &snapshot[j].link_dirs);
+                changed |= merge_unique(&mut target.link_flags, &snapshot[j].link_flags);
+                changed |= merge_unique(&mut target.pkg_config, &snapshot[j].pkg_config);
+                changed |= exp_new.merge(&snapshot[j]);
+            }
+            // private 依赖（private_deps）：只并入本级编译集，不进导出集。
+            for dep in &target.private_deps {
+                let &j = index.get(dep).expect("private_dep 存在性已校验");
+                if j == i {
+                    continue;
+                }
+                if matches!(kinds[j], TargetKind::Exe | TargetKind::Phony) {
+                    continue;
+                }
+                changed |= merge_unique(&mut target.include_dirs, &snapshot[j].include_dirs);
+                changed |= merge_unique(&mut target.defines, &snapshot[j].defines);
+                changed |= merge_unique(&mut target.link, &snapshot[j].link);
+                changed |= merge_unique(&mut target.link_dirs, &snapshot[j].link_dirs);
+                changed |= merge_unique(&mut target.link_flags, &snapshot[j].link_flags);
+                changed |= merge_unique(&mut target.pkg_config, &snapshot[j].pkg_config);
+            }
+            if exp_new != exports[i] {
+                exports[i] = exp_new;
+                changed = true;
             }
         }
         if !changed {
@@ -1202,6 +1387,152 @@ fn merge_unique<T: PartialEq + Clone>(dst: &mut Vec<T>, src: &[T]) -> bool {
         }
     }
     changed
+}
+
+/// `[[checks]]` 执行器：try-compile+link，带磁盘缓存（`<cache_dir>/checks.json`）。
+/// 检测成功 → `vars[name] = "1"`；失败 → `"0"`（fail_fatal 则整体报错）。
+fn run_checks(
+    checks: &[Check],
+    defaults: &Defaults,
+    dir: &Path,
+    out_dir: &Path,
+    cache_dir: &Path,
+    vars: &mut BTreeMap<String, String>,
+    import_defines: &mut Vec<String>,
+) -> Result<(), String> {
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let check_dir = out_dir.join("checks");
+    std::fs::create_dir_all(&check_dir)
+        .map_err(|e| format!("创建检测目录 {} 失败: {e}", check_dir.display()))?;
+
+    // 磁盘缓存：hash -> bool。
+    let cache_path = cache_dir.join("checks.json");
+    let mut cache: BTreeMap<String, bool> = std::fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mut cache_dirty = false;
+
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for chk in checks {
+        let name = chk.name.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(format!("check：name '{name}' 非法（仅字母数字 / '-' / '_' / '.'）"));
+        }
+        if !seen.insert(name.to_string()) {
+            return Err(format!("check：name '{name}' 重复"));
+        }
+        let sub = |s: &str| substitute_vars(s, vars);
+        let source = match (&chk.source, &chk.source_file) {
+            (Some(s), None) => sub(s),
+            (None, Some(f)) => {
+                let f = sub(f);
+                let p = if Path::new(&f).is_absolute() {
+                    PathBuf::from(&f)
+                } else {
+                    dir.join(&f)
+                };
+                std::fs::read_to_string(&p)
+                    .map_err(|e| format!("check '{name}'：读取 source_file {} 失败: {e}", p.display()))?
+            }
+            _ => {
+                return Err(format!(
+                    "check '{name}'：source 与 source_file 必须二选一（不多不少）"
+                ))
+            }
+        };
+        let kind_raw = if chk.kind.trim().is_empty() {
+            "cxx".to_string()
+        } else {
+            chk.kind.trim().to_lowercase()
+        };
+        let is_c = matches!(kind_raw.as_str(), "c");
+        let is_cpp = matches!(kind_raw.as_str(), "cxx" | "cpp" | "c++");
+        if !is_c && !is_cpp {
+            return Err(format!(
+                "check '{name}'：kind 必须是 c 或 cxx（得到 '{kind_raw}'）"
+            ));
+        }
+        let cc = if is_c { &defaults.cc } else { &defaults.cxx };
+        let cc = sub(cc);
+        let defines: Vec<String> = chk.defines.iter().map(|d| sub(d)).collect();
+        let libraries: Vec<String> = chk.libraries.iter().map(|d| sub(d)).collect();
+
+        // 缓存键：编译器 + 源 + 宏 + 库。
+        let key_src = format!(
+            "v1\n{cc}\n{kind_raw}\n{source}\n{}\n{}",
+            defines.join(","),
+            libraries.join(",")
+        );
+        let key = blake3::hash(key_src.as_bytes()).to_hex().to_string();
+
+        let ok = match cache.get(&key) {
+            Some(&v) => v,
+            None => {
+                let ext = if is_c { "c" } else { "cpp" };
+                let src_path = check_dir.join(format!("{name}.{ext}"));
+                let exe_path = check_dir.join(format!("{name}.bin"));
+                std::fs::write(&src_path, &source)
+                    .map_err(|e| format!("check '{name}'：写入检测源 {} 失败: {e}", src_path.display()))?;
+                let msvc = crate::compiler::is_msvc_compiler(&cc);
+                let mut cmd = std::process::Command::new(&cc);
+                if msvc {
+                    cmd.arg("/nologo");
+                    for d in &defines {
+                        cmd.arg(format!("/D{d}"));
+                    }
+                    for l in &libraries {
+                        cmd.arg(crate::compiler::msvc_lib_name(l));
+                    }
+                    cmd.arg(format!("/Fe{}", exe_path.display()));
+                    cmd.arg(&src_path);
+                } else {
+                    for d in &defines {
+                        cmd.arg(format!("-D{d}"));
+                    }
+                    cmd.arg(&src_path);
+                    cmd.arg("-o");
+                    cmd.arg(&exe_path);
+                    for l in &libraries {
+                        cmd.arg(format!("-l{l}"));
+                    }
+                }
+                let out = cmd
+                    .output()
+                    .map_err(|e| format!("check '{name}'：无法启动编译器 '{cc}': {e}"))?;
+                let v = out.status.success();
+                cache.insert(key, v);
+                cache_dirty = true;
+                v
+            }
+        };
+        vars.insert(name.to_string(), if ok { "1".into() } else { "0".into() });
+        if ok {
+            if let Some(d) = &chk.define {
+                let d = substitute_vars(d, vars);
+                if !d.trim().is_empty() && !import_defines.contains(&d) {
+                    import_defines.push(format!("{d}=1"));
+                }
+            }
+        } else if chk.fail_fatal {
+            return Err(format!(
+                "check '{name}'：try-compile 未通过（fail_fatal = true）"
+            ));
+        }
+    }
+    if cache_dirty {
+        let _ = std::fs::create_dir_all(cache_dir);
+        if let Ok(text) = serde_json::to_string_pretty(&cache) {
+            let _ = crate::fsutil::atomic_write(&cache_path, text.as_bytes());
+        }
+    }
+    Ok(())
 }
 
 /// 判断字符串是否像库名（`-l` 风格：无分隔符、无常见库文件后缀）。
@@ -1770,6 +2101,69 @@ deps = ["util"]
         assert!(app.defines.contains(&"UTIL=1".to_string()));
         assert!(app.link.contains(&"m".to_string()));
         assert!(app.link.contains(&"pthread".to_string()));
+    }
+
+    #[test]
+    fn private_deps_not_exported() {
+        let d = tmpdir();
+        std::fs::create_dir_all(d.join("a-inc")).unwrap();
+        std::fs::write(d.join("a.c"), "int a(void){return 0;}\n").unwrap();
+        std::fs::write(d.join("b.c"), "int b(void){return 0;}\n").unwrap();
+        std::fs::write(d.join("main.c"), "int b(void); int main(void){return b();}\n").unwrap();
+        let s = BuildScript::parse(
+            r#"
+[[targets]]
+name = "a"
+kind = "static"
+sources = ["a.c"]
+include_dirs = ["a-inc"]
+defines = ["A_FLAG=1"]
+link = ["m"]
+
+[[targets]]
+name = "b"
+kind = "static"
+sources = ["b.c"]
+private_deps = ["a"]
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["main.c"]
+deps = ["b"]
+"#,
+        )
+        .unwrap();
+        let r = s.resolve_default(&d).unwrap();
+        let b = r.targets.iter().find(|t| t.name == "b").unwrap();
+        let app = r.targets.iter().find(|t| t.name == "app").unwrap();
+        // b 自己编译能看到 a 的使用要求。
+        assert!(b.include_dirs.iter().any(|p| p.ends_with("a-inc")));
+        assert!(b.defines.contains(&"A_FLAG=1".to_string()));
+        assert!(b.link.contains(&"m".to_string()));
+        // app 不能经由 b 看到 a 的私有使用要求（include/define/-l）。
+        assert!(!app.include_dirs.iter().any(|p| p.ends_with("a-inc")));
+        assert!(!app.defines.contains(&"A_FLAG=1".to_string()));
+        // 链接层面 a 仍会出现在 app 的链接链路中（collect_link_libs 覆盖 private），
+        // 这里只校验传播语义。
+        assert!(!app.link.contains(&"m".to_string()));
+    }
+
+    #[test]
+    fn private_dep_missing_is_error() {
+        let d = tmpdir();
+        std::fs::write(d.join("main.c"), "int main(void){return 0;}\n").unwrap();
+        let s = BuildScript::parse(
+            r#"
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["main.c"]
+private_deps = ["nonexistent"]
+"#,
+        )
+        .unwrap();
+        assert!(s.resolve_default(&d).is_err());
     }
 
     #[test]

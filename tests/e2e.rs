@@ -368,6 +368,236 @@ strip_components = 1
 }
 
 #[test]
+fn private_deps_link_but_not_propagate() {
+    let d = tmpdir("private-deps");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "privdemo"
+
+[[targets]]
+name = "a"
+kind = "static"
+sources = ["src/a.c"]
+include_dirs = ["include/a"]
+defines = ["A_FLAG=55"]
+
+[[targets]]
+name = "b"
+kind = "static"
+sources = ["src/b.c"]
+include_dirs = ["include/b"]
+private_deps = ["a"]
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+deps = ["b"]
+"#,
+    );
+    write(&d.join("include/a/a.h"), "int a_val(void);\n");
+    write(&d.join("src/a.c"), "int a_val(void){return 5;}\n");
+    write(&d.join("include/b/b.h"), "int b_val(void);\n");
+    write(&d.join("src/b.c"), "#include <a.h>\n#include <b.h>\nint b_val(void){return a_val() + 2;}\n");
+    write(&d.join("src/main.c"), "#include <stdio.h>\n#include <b.h>\n#ifdef A_FLAG\n#error A_FLAG 不应从 b 传播到 app\n#endif\nint main(void){printf(\"%d\\n\", b_val());return 0;}\n");
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "私有依赖构建失败: {err}");
+    let out = Command::new(d.join("build/app")).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "7\n",
+        "私有依赖链接/运行失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn checks_try_compile_and_inject() {
+    let d = tmpdir("checks");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "chk"
+
+[[checks]]
+name = "has_it"
+source = "int main(void){return 0;}"
+define = "HAVE_IT"
+
+[[checks]]
+name = "never_true"
+source = "this is not valid C code ((("
+fail_fatal = false
+
+[[targets]]
+name = "chk"
+kind = "exe"
+sources = ["src/main.c"]
+defines = ["NEVER_TRUE=${never_true}", "HAS_IT=${has_it}"]
+"#,
+    );
+    write(
+        &d.join("src/main.c"),
+        "#ifndef HAVE_IT\n#error HAVE_IT 未注入\n#endif\nint main(void){return NEVER_TRUE + HAS_IT - 1;}\n",
+    );
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "checks 构建失败: {err}");
+    let out = Command::new(d.join("build/chk")).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "NEVER_TRUE=0 HAS_IT=1 应返回 0");
+    assert!(d.join(".ns-cache/checks.json").exists(), "检测结果未缓存");
+
+    // fail_fatal：检测失败直接构建报错。
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "chk2"
+
+[[checks]]
+name = "never_fatal"
+source = "this is not valid C code ((("
+fail_fatal = true
+
+[[targets]]
+name = "chk2"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+    );
+    write(&d.join("src/main.c"), "int main(void){return 0;}\n");
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_ne!(code, 0, "fail_fatal 检测失败必须构建失败");
+    assert!(err.contains("never_fatal"), "错误信息应包含检测名: {err}");
+}
+
+#[test]
+fn soversion_links_and_installs() {
+    let d = tmpdir("soversion");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "solver"
+version = "1.0.0"
+
+[[targets]]
+name = "mylib"
+kind = "lib"
+sources = ["src/lib.c"]
+soversion = "1"
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+deps = ["mylib"]
+"#,
+    );
+    write(&d.join("src/lib.c"), "int mylib_answer(void){return 42;}\n");
+    write(&d.join("src/main.c"), "#include <stdio.h>\nint mylib_answer(void);\nint main(void){printf(\"%d\\n\", mylib_answer());return 0;}\n");
+
+    let (real, dev) = if cfg!(target_os = "macos") {
+        ("libmylib.1.dylib", "libmylib.dylib")
+    } else {
+        ("libmylib.so.1", "libmylib.so")
+    };
+
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "soversion 构建失败: {err}");
+    let real_path = d.join("build").join(real);
+    let dev_path = d.join("build").join(dev);
+    assert!(real_path.exists(), "带版本动态库未生成: {}", real_path.display());
+    let link_target = std::fs::read_link(&dev_path).expect("读取开发者符号链接失败");
+    assert_eq!(link_target, std::path::Path::new(real), "开发者符号链接应指向带版本文件");
+    // 可直接运行（链接了带版本库）。
+    let out = Command::new(d.join("build/app")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+
+    // install：两个名字都安装并重建符号链接。
+    let prefix = d.join("prefix");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix.to_str().unwrap()],
+        &d,
+    );
+    assert_eq!(code, 0, "install 失败: {err}");
+    assert!(prefix.join("lib").join(real).exists(), "install 缺少版本库");
+    assert_eq!(
+        std::fs::read_link(prefix.join("lib").join(dev)).unwrap(),
+        std::path::PathBuf::from(real),
+        "install 前缀下开发者符号链接错误"
+    );
+}
+
+#[test]
+fn package_creates_archive_with_pc_export() {
+    let d = tmpdir("package");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "mypkg"
+version = "2.3.4"
+
+[[install_headers]]
+from = "include"
+to = "include"
+files = ["**/*.h"]
+
+[[targets]]
+name = "mypkg"
+kind = "static"
+sources = ["src/lib.c"]
+link = ["m"]
+
+[[exports]]
+name = "mypkg"
+pc = true
+"#,
+    );
+    write(&d.join("include/mypkg.h"), "int mypkg_ans(void);\n");
+    write(&d.join("src/lib.c"), "int mypkg_ans(void){return 42;}\n");
+
+    // install：验证 .pc 内容（prefix 无关，relocatable）。
+    let prefix = d.join("prefix");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix.to_str().unwrap()],
+        &d,
+    );
+    assert_eq!(code, 0, "install 失败: {err}");
+    let pc_text = std::fs::read_to_string(prefix.join("lib/pkgconfig/mypkg.pc"))
+        .expect("mypkg.pc 未生成");
+    assert!(pc_text.contains("prefix=${pcfiledir}/../.."), "pc prefix 应 relocatable: {pc_text}");
+    assert!(pc_text.contains("Name: mypkg"), "pc 缺 Name: {pc_text}");
+    assert!(pc_text.contains("Version: 2.3.4"), "pc 缺版本: {pc_text}");
+    assert!(pc_text.contains("-lmypkg"), "pc 缺 -lmypkg: {pc_text}");
+    assert!(pc_text.contains("-lm"), "pc 缺 Libs.private: {pc_text}");
+    assert!(pc_text.contains("Cflags: -I${includedir}"), "pc 缺 Cflags: {pc_text}");
+
+    // package：打包 dist/<name>-<version>.tar.gz。
+    let (_, err, code) = run_ns_build(&["package", "--format", "tar.gz"], &d);
+    assert_eq!(code, 0, "package 失败: {err}");
+    let archive = d.join("dist/mypkg-2.3.4.tar.gz");
+    assert!(archive.exists(), "打包产物不存在: {}", archive.display());
+    let listing = Command::new("tar")
+        .args(["-tzf"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    for needle in [
+        "include/mypkg.h",
+        "lib/libmypkg.a",
+        "lib/pkgconfig/mypkg.pc",
+        "lib/cmake/mypkg/mypkg-config.toml",
+    ] {
+        assert!(listing.contains(needle), "打包缺少 {needle}: {listing}");
+    }
+}
+
+#[test]
 fn builds_hello_c_and_runs() {
     let d = tmpdir("hello");
     write(

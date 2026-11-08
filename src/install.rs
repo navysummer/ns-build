@@ -31,7 +31,21 @@ pub fn install_all(script: &ResolvedScript, prefix: &Path) -> Result<InstallRepo
             }
             TargetKind::Lib | TargetKind::Static | TargetKind::Module => {
                 let dest_dir = prefix.join("lib");
-                copy_if_changed(&t.output, &dest_dir.join(file_name(&t.output)), &mut report)?;
+                let dest_name = file_name(&t.output);
+                copy_if_changed(&t.output, &dest_dir.join(&dest_name), &mut report)?;
+                // soversion：在 prefix/lib 下创建开发者符号链接（libfoo.so → libfoo.so.1）。
+                #[cfg(unix)]
+                if t.soversion.is_some() && t.kind != TargetKind::Static {
+                    if let Some(dev) = crate::platform::Os::dev_link_name(&dest_name) {
+                        if dev != dest_name {
+                            let dev_path = dest_dir.join(&dev);
+                            let _ = std::fs::remove_file(&dev_path);
+                            std::os::unix::fs::symlink(&dest_name, &dev_path).map_err(|e| {
+                                format!("创建符号链接 {} 失败: {e}", dev_path.display())
+                            })?;
+                        }
+                    }
+                }
             }
             TargetKind::Phony | TargetKind::Interface | TargetKind::Object => {}
         }
@@ -165,6 +179,11 @@ fn install_exports(
         } else {
             exp.to.clone()
         };
+        let pkg_ver = if exp.version.is_empty() {
+            script.script.project.version.clone()
+        } else {
+            exp.version.clone()
+        };
         let to_dir = prefix.join(&to);
         std::fs::create_dir_all(&to_dir)
             .map_err(|e| format!("创建导出目录 {} 失败: {e}", to_dir.display()))?;
@@ -174,6 +193,35 @@ fn install_exports(
         std::fs::write(&path, &text)
             .map_err(|e| format!("写入导出配置 {} 失败: {e}", path.display()))?;
         println!("[ns-build] 导出包 {} -> {}", exp.name, path.display());
+
+        // 可选：同时生成 lib/pkgconfig/<name>.pc（relocatable）。
+        if exp.pc {
+            let libs: Vec<String> = config
+                .targets
+                .iter()
+                .filter_map(|t| crate::export::pc_lib_name(&t.output))
+                .collect();
+            let privates: Vec<String> = config
+                .targets
+                .iter()
+                .flat_map(|t| t.link.iter())
+                .map(|l| crate::export::pc_private_lib(l))
+                .collect();
+            let pc_dir = prefix.join("lib").join("pkgconfig");
+            std::fs::create_dir_all(&pc_dir)
+                .map_err(|e| format!("创建 pkgconfig 目录 {} 失败: {e}", pc_dir.display()))?;
+            let pc = crate::export::render_pc_file(
+                &exp.name,
+                &script.script.project.name,
+                &pkg_ver,
+                &libs,
+                &privates,
+            );
+            let pc_path = pc_dir.join(format!("{}.pc", exp.name));
+            std::fs::write(&pc_path, pc)
+                .map_err(|e| format!("写入 pkg-config 文件 {} 失败: {e}", pc_path.display()))?;
+            println!("[ns-build] 导出 pkg-config {} -> {}", exp.name, pc_path.display());
+        }
         report.installed += selected.len();
     }
     Ok(())

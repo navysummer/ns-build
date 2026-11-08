@@ -54,6 +54,39 @@ impl Os {
         }
     }
 
+    /// 带 soversion 的动态库文件名：`libfoo.so.N`（Linux）/ `libfoo.N.dylib`（macOS）。
+    pub fn dylib_name_versioned(&self, base: &str, version: &str) -> String {
+        match self {
+            Self::Macos | Self::Ios => format!("lib{}.{}.dylib", base, version),
+            _ => format!("lib{}.so.{}", base, version),
+        }
+    }
+
+    /// 开发者符号链接名（去掉版本）：`libfoo.so` / `libfoo.dylib`。
+    pub fn dylib_dev_link(&self, base: &str) -> String {
+        match self {
+            Self::Windows => format!("{}.dll", base),
+            Self::Macos | Self::Ios => format!("lib{}.dylib", base),
+            _ => format!("lib{}.so", base),
+        }
+    }
+
+    /// 从实际库文件名推出开发者符号链接名：
+    /// `libfoo.so.1` → `libfoo.so`，`libfoo.1.dylib` → `libfoo.dylib`。
+    pub fn dev_link_name(file_name: &str) -> Option<String> {
+        if let Some(idx) = file_name.find(".so") {
+            return Some(file_name[..idx + 3].to_string());
+        }
+        if let Some(stem) = file_name.strip_suffix(".dylib") {
+            let dev = match stem.rfind('.') {
+                Some(i) => &stem[..i],
+                None => stem,
+            };
+            return Some(format!("{dev}.dylib"));
+        }
+        None
+    }
+
     /// 静态库文件名，如 `libfoo.a`。
     pub fn static_name(&self, base: &str) -> String {
         format!("lib{}.a", base)

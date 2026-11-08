@@ -200,7 +200,7 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
                     link_inputs.extend(t.sources.iter().cloned());
                 }
                 let mut seen_libs: BTreeSet<String> = BTreeSet::new();
-                for dep in &t.deps {
+                for dep in t.deps.iter().chain(t.private_deps.iter()) {
                     let dep_t = targets_by_name
                         .get(dep.as_str())
                         .ok_or_else(|| format!("target '{}' 依赖不存在的 target '{}'", t.name, dep))?;
@@ -276,7 +276,7 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
         let Some(&me) = outputs.get(&t.name) else {
             continue;
         };
-        for dep in &t.deps {
+        for dep in t.deps.iter().chain(t.private_deps.iter()) {
             let Some(&dn) = outputs.get(dep) else {
                 return Err(format!("target '{}' 依赖不存在的 target '{}'", t.name, dep));
             };
@@ -467,7 +467,7 @@ fn collect_link_libs(
     {
         out.push(t.output.clone());
     }
-    for dep in &t.deps {
+    for dep in t.deps.iter().chain(t.private_deps.iter()) {
         collect_link_libs(dep, targets, out, seen);
     }
 }
@@ -654,6 +654,7 @@ mod tests {
             link_flags: vec![],
             defines: vec![],
             deps: vec![],
+            private_deps: vec![],
             output: PathBuf::from("out"),
             groups: Some(2),
             group_size: None,
@@ -662,13 +663,16 @@ mod tests {
             profile: crate::script::Profile::Release,
             strip: false,
             warnings: true,
+            werror: false,
+            rpath: vec![],
+            soversion: None,
             install: true,
             language: Language::C,
             c_std: None,
             cxx_std: None,
             pkg_config: vec![],
             when: None,
-            pch: None,
+            pch: vec![],
         };
         assert_eq!(decide_groups(&t, 5, "auto", 8), Some(2));
     }
@@ -692,6 +696,7 @@ mod tests {
             link_flags: vec![],
             defines: vec![],
             deps: vec![],
+            private_deps: vec![],
             output: PathBuf::from("out"),
             groups: None,
             group_size: Some(3),
@@ -700,13 +705,16 @@ mod tests {
             profile: crate::script::Profile::Release,
             strip: false,
             warnings: true,
+            werror: false,
+            rpath: vec![],
+            soversion: None,
             install: true,
             language: Language::C,
             c_std: None,
             cxx_std: None,
             pkg_config: vec![],
             when: None,
-            pch: None,
+            pch: vec![],
         };
         assert_eq!(decide_groups(&t, 7, "auto", 8), Some(3));
     }
@@ -730,6 +738,7 @@ mod tests {
             link_flags: vec![],
             defines: vec![],
             deps: vec![],
+            private_deps: vec![],
             output: PathBuf::from("out"),
             groups: None,
             group_size: None,
@@ -738,13 +747,16 @@ mod tests {
             profile: crate::script::Profile::Release,
             strip: false,
             warnings: true,
+            werror: false,
+            rpath: vec![],
+            soversion: None,
             install: true,
             language: Language::C,
             c_std: None,
             cxx_std: None,
             pkg_config: vec![],
             when: None,
-            pch: None,
+            pch: vec![],
         };
         assert_eq!(decide_groups(&t, 300, "auto", 8), Some(8));
         assert_eq!(decide_groups(&t, 300, "off", 8), None);

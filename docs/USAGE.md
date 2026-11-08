@@ -10,6 +10,7 @@
 | `ns-build clean` | 删除 `build/` 与缓存 |
 | `ns-build test [--all] [--label L] [-j N]` | 构建并运行测试（`--label` 只跑带该标签的 `[[tests]]`，可重复） |
 | `ns-build install [--prefix P]` | 安装到前缀（默认 `/usr/local`；`[[exports]]` 的配置文件一并写入） |
+| `ns-build package [--format tar.gz\|zip]` | install 到 staging 并打包为归档（默认 `dist/<name>-<version>.tar.gz`） |
 | `ns-build run <目标> [-- 参数...]` | 构建并运行目标 |
 | `ns-build show` | 列出目标 |
 | `ns-build graph` | 打印依赖图 |
@@ -46,6 +47,7 @@ TOML 声明式。顶层节：
 - `[[install_headers]]`：头文件安装规则
 - `[[install_files]]`：通用文件/目录安装规则
 - `[[tests]]`：显式测试注册
+- `[[checks]]`：编译器特性检测（`check_cxx_compiler_flag`）
 - `[presets]`：命名构建预设（`--preset`）
 - `includes = [...]`：子脚本（目录或 `ns-build.toml` 文件路径）
 
@@ -64,6 +66,7 @@ TOML 声明式。顶层节：
 | `toolchain` | 默认使用的 `[[toolchains]]` 名 | 自动按 os/arch 匹配 |
 | `strip` | 剥离符号 | `false` |
 | `warnings` | 警告标志（`-Wall -Wextra`） | `true` |
+| `werror` | 警告即错误（`-Werror` / `/WX`） | `false` |
 | `cache` | 缓存目录（相对项目） | `.ns-cache` |
 | `variables` | 变量表（`${name}` 替换） | `{}` |
 
@@ -83,7 +86,8 @@ TOML 声明式。顶层节：
 | `link_dirs` | 库搜索目录 |
 | `link_flags` | 链接标志 |
 | `defines` | 宏定义（`-D`） |
-| `deps` | 依赖目标：object 库对象并入；静态/动态库产物直接链接（静态链式依赖递归收集）；include/defines 等使用要求传递传播 |
+| `deps` | 依赖目标：object 库对象并入；静态/动态库产物直接链接（静态链式依赖递归收集，含 private_deps）；include/defines 等使用要求**传递传播** |
+| `private_deps` | 私有依赖：参与编译与链接，但使用要求不向下游重导出（CMake PRIVATE） |
 | `output` | 产物名（相对 out）；默认按 target 名 + 平台后缀（见下） |
 | `groups` / `group_size` | 分步编译：分组数 / 每组文件数（二选一） |
 | `parallel` | 是否并行（默认 `true`） |
@@ -91,11 +95,14 @@ TOML 声明式。顶层节：
 | `os` / `arch` | 平台过滤（按**目标平台**过滤，`["linux", "macos"]`） |
 | `profile` | 目标级配置覆盖 |
 | `strip` | 目标级剥离 |
+| `werror` | 目标级警告即错误（覆盖 `defaults.werror`） |
+| `soversion` | 动态库版本（如 `"1"`）：输出 `libfoo.so.1` / `libfoo.1.dylib`，并创建开发者符号链接 `libfoo.so` / `libfoo.dylib`（soname / install_name） |
+| `rpath` | 链接时写入的运行时库搜索路径（`-Wl,-rpath`）；支持 `$ORIGIN`（`$ORIGIN/../lib` 可让安装后的二进制找到 `prefix/lib`）与相对路径（相对脚本目录解析）；Windows 忽略 |
 | `install` | 是否安装（默认 `true`） |
 | `when` | 条件表达式（`os == "linux" && arch == "x86_64"`，支持 `!`/括号） |
 | `c_std` / `cxx_std` | 编译标准（`c11` / `gnu11` / `c++17` / `c++20`） |
 | `pkg_config` | pkg-config 包名（编译展开 `--cflags`，链接展开 `--libs`） |
-| `pch` | 预编译头（`-include`） |
+| `pch` | 预编译头：`pch = "stdafx.h"` 或 `["a.h", "b.h"]`（`-include` / `/FI`） |
 
 ### `[[toolchains]]`
 
@@ -182,7 +189,16 @@ includes = ["sub"]      # sub/ns-build.toml，或直接 "sub/ns-build.toml"
 
 ### 依赖使用要求的传播
 
-依赖目标（`deps`）声明的 `include_dirs`、`defines`、`link`、`link_dirs`、`link_flags`、`pkg_config` 会**传递性传播**给依赖者（可执行文件与别名除外——它们不可链接）。`INTERFACE` 头文件库只传递 `include_dirs`/`defines`，自身无产物。链接时：
+依赖目标（`deps`）声明的 `include_dirs`、`defines`、`link`、`link_dirs`、`link_flags`、`pkg_config` 会**传递性传播**给依赖者（可执行文件与别名除外——它们不可链接）。`INTERFACE` 头文件库只传递 `include_dirs`/`defines`，自身无产物。**`private_deps`** 与 `deps` 参与编译与链接，但其使用要求**不会**向下游重导出（CMake PRIVATE 语义）：
+
+```toml
+[[targets]]
+name = "app"
+deps = ["publiclib"]        # 传递给依赖 app 的目标
+private_deps = ["implib"]   # 仅 app 自己链接/编译需要，不外传
+```
+
+链接时：
 
 - `object` 依赖 → 对象并入链接输入（静态库归档也是）
 - `static`/`lib`/`module` 依赖 → 其产物直接链接；静态库链式依赖会递归收集，无需在最终 target 重复声明
@@ -252,7 +268,10 @@ name = "mylib"                 # 导出包名
 targets = ["core", "util"]      # 空 = 所有 install 的 static/lib/module 目标
 to = "lib/cmake/mylib"         # 相对 prefix（默认 lib/cmake/<name>）
 version = "1.0.0"               # 默认 project.version
+pc = true                      # 同时生成 lib/pkgconfig/<name>.pc（relocatable，prefix = ${pcfiledir}/../..）
 ```
+
+`pc = true` 时生成标准的 `.pc`：`Name:`/`Version:`/`Libs:`（产物 `-l<name>`）/`Libs.private:`（依赖的 `-l`）/`Cflags: -I${includedir}`，供非 ns-build 下游用 `pkg-config --libs --cflags mylib` 使用。
 
 下游项目导入该包（`find_package` 等价）——`include_dirs` 并入所有目标，产物以绝对路径参与链接：
 
@@ -261,6 +280,18 @@ version = "1.0.0"               # 默认 project.version
 from = "/usr/local"            # 前缀目录 / 配置文件路径 / 含 <name>-config.toml 的目录
 name = "mylib"
 ```
+
+### `ns-build package`
+
+把 `install` 规则的输出打包成发布归档（CPack 简化版）：先完整 `install` 到 `out/package-root/`（含 exports/pc/soversion 链接），再归档到 `dist/`：
+
+```bash
+ns-build package                          # 默认 tar.gz → dist/<name>-<version>.tar.gz
+ns-build package --format zip             # zip 归档
+ns-build package --name mypkg-bin --dest out/dist
+```
+
+打包内容 = 正常 install 的目录布局（`bin/`、`lib/`、`include/`、`lib/pkgconfig/`、`lib/cmake/`）。`clean` 不删除 `dist/`。需要 bsdtar（macOS/Windows 自带）或 GNU tar / zip。
 
 ### `[[fetch]]`
 
@@ -285,6 +316,33 @@ ns-build fetch --update   # 强制重新拉取
 ```
 
 拉取到项目根下 `.ns-fetch/<name>/`，并附 `.ns-fetch.toml` 清单。`clean` 不删除（同 git submodule，属源码而非产物）。
+
+### `[[checks]]`
+
+编译器/库特性检测（CMake `check_cxx_compiler_flag` / `CHECK_INCLUDE_FILE` 等价）。**解析期**做一次 try-compile+link（结果含编译器/源码/宏/库指纹缓存在 `.ns-cache/checks.json`，第二次起不再编译），结果注入两个东西：
+
+- `${name}` 变量：检测通过 → `"1"`，否则 `"0"`
+- `define` 宏（可选）：检测通过时向所有 target 注入 `-D<define>=1`
+
+```toml
+[[checks]]
+name = "has_stdfs"                       # 同时是 ${has_stdfs}
+source = "#include <filesystem>\nint main(void){std::filesystem::path p(\".\");return p.empty();}"
+define = "HAVE_STDFS"                    # 通过 → -DHAVE_STDFS=1 注入所有目标
+# kind = "cxx"                          # c | cxx（默认 cxx）
+# source_file = "checks/check.c"        # 外部源文件（相对脚本目录）
+# defines = ["EXTRA=1"]                 # 检测时额外 -D
+# libraries = ["stdc++fs"]              # 检测时 -l
+# fail_fatal = true                     # 检测失败直接报错（默认仅为 0）
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+defines = ["STDFS=${has_stdfs}"]
+```
+
+检测源必须是完整程序（含 `main`）。缓存按（编译器、kind、源、宏、库）哈希，任一变化都会重新检测。
 
 ## 完整示例
 

@@ -22,6 +22,7 @@ const USAGE: &str = r#"ns-build — 现代化跨平台构建系统
   ns-build graph
   ns-build presets
   ns-build fetch [--update]
+  ns-build package [--format tar.gz|zip] [--name <名>] [--dest <目录>]
   ns-build init [--name <名>]
 
 选项:
@@ -64,6 +65,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "init" => cmd_init(&args[1..]),
         "presets" => cmd_presets(),
         "fetch" => cmd_fetch(&args[1..]),
+        "package" | "pack" => cmd_package(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
@@ -205,7 +207,7 @@ fn expand_targets(
             continue;
         }
         if let Some(t) = by_name.get(name.as_str()) {
-            for dep in &t.deps {
+            for dep in t.deps.iter().chain(t.private_deps.iter()) {
                 if !allowed.contains(dep) {
                     stack.push(dep.clone());
                 }
@@ -310,6 +312,8 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     };
     let report = execute(&mut p, &mut cache, &opts, &resolved.dir)?;
     cache.save()?;
+    // soversion：链接成功后在 out 目录创建开发者符号链接（libfoo.so → libfoo.so.1）。
+    create_soversion_links(&resolved)?;
     // 生成 compile_commands.json（供 clangd / IDE）。
     let cc_json = ns_build::planner::generate_compile_commands(&p, &resolved.dir);
     let cc_path = resolved.out_dir.join("compile_commands.json");
@@ -325,6 +329,45 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     if report.failed > 0 {
         return Err(format!("{} 个任务失败", report.failed));
     }
+    Ok(())
+}
+
+/// 为有 `soversion` 的动态库/模块在输出目录创建开发者符号链接
+///（unix 流派：`libfoo.so` → `libfoo.so.1`，`libfoo.dylib` → `libfoo.1.dylib`）。
+fn create_soversion_links(script: &ns_build::script::ResolvedScript) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        for t in &script.targets {
+            if t.soversion.is_none() || t.host.os.is_windows_family() {
+                continue;
+            }
+            if !matches!(
+                t.kind,
+                ns_build::script::TargetKind::Lib | ns_build::script::TargetKind::Module
+            ) {
+                continue;
+            }
+            let real = &t.output;
+            if !real.exists() {
+                continue;
+            }
+            let Some(fname) = real.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+                continue;
+            };
+            let Some(dev) = ns_build::platform::Os::dev_link_name(&fname) else {
+                continue;
+            };
+            if dev == fname {
+                continue;
+            }
+            let dev_path = real.parent().unwrap_or(std::path::Path::new(".")).join(&dev);
+            // 已存在则替换（同名文件/链接）。
+            let _ = std::fs::remove_file(&dev_path);
+            std::os::unix::fs::symlink(&fname, &dev_path)
+                .map_err(|e| format!("创建符号链接 {} 失败: {e}", dev_path.display()))?;
+        }
+    }
+    let _ = script;
     Ok(())
 }
 
@@ -727,6 +770,128 @@ fn fetch_url(name: &str, url: &str, strip_components: usize, dest: &std::path::P
     std::fs::write(dest.join(".ns-fetch.toml"), manifest)
         .map_err(|e| format!("fetch '{name}'：写入清单失败: {e}"))?;
     println!("[ns-build] 已拉取 {name}");
+    Ok(())
+}
+
+/// `ns-build package`：install 到临时 staging，再打包为 tar.gz / zip（CPack 简化版）。
+fn cmd_package(args: &[String]) -> Result<(), String> {
+    let mut format = "tar.gz".to_string();
+    let mut name: Option<String> = None;
+    let mut dest_dir: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--format" | "-f" => {
+                i += 1;
+                let v = args.get(i).ok_or("--format 需要 tar.gz 或 zip")?;
+                if v != "tar.gz" && v != "zip" {
+                    return Err(format!("不支持的格式 '{v}'（tar.gz | zip）"));
+                }
+                format = v.clone();
+            }
+            v if v.starts_with("--format=") => {
+                let v = v["--format=".len()..].to_string();
+                if v != "tar.gz" && v != "zip" {
+                    return Err(format!("不支持的格式 '{v}'（tar.gz | zip）"));
+                }
+                format = v;
+            }
+            "--name" | "-n" => {
+                i += 1;
+                name = Some(args.get(i).ok_or("--name 需要参数")?.clone());
+            }
+            "--dest" | "-d" => {
+                i += 1;
+                dest_dir = Some(args.get(i).ok_or("--dest 需要参数")?.clone());
+            }
+            "--help" | "-h" => {
+                println!("ns-build package [--format tar.gz|zip] [--name <名>] [--dest <目录>]");
+                return Ok(());
+            }
+            v => return Err(format!("未知选项 '{v}'（ns-build package [--format tar.gz|zip]）")),
+        }
+        i += 1;
+    }
+    // 先构建（与 `ns-build test` 同一模式）。
+    cmd_build(&["--quiet".to_string()])?;
+    let dir = std::env::current_dir().map_err(|e| e.to_string())?;
+    let (script, script_dir) = load(&dir)?;
+    let resolved = script.resolve_default(&script_dir)?;
+
+    // staging：install 规则输出到 out/package-root/。
+    let staging = resolved.out_dir.join("package-root");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|e| format!("清理 staging {} 失败: {e}", staging.display()))?;
+    }
+    let install_report = ns_build::install::install_all(&resolved, &staging)?;
+    if install_report.installed == 0 && install_report.skipped == 0 {
+        return Err("package：没有可打包的安装产物（install 规则为空）".into());
+    }
+
+    // 包名：<project>-<version>，非法字符替换为 '_'。
+    let raw = name.unwrap_or_else(|| {
+        format!(
+            "{}-{}",
+            script.project.name, script.project.version
+        )
+    });
+    let safe: String = raw
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let dest = dest_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.join("dist"));
+    std::fs::create_dir_all(&dest).map_err(|e| format!("创建 {} 失败: {e}", dest.display()))?;
+    let archive = dest.join(format!("{safe}.{format}"));
+
+    // bsdtar（macOS/Windows）原生支持 zip；否则回退到 zip -r。
+    let try_bsdtar = std::process::Command::new("tar")
+        .args(["-acf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&staging)
+        .arg(".")
+        .status();
+    let ok = match try_bsdtar {
+        Ok(s) if s.success() && archive.exists() => true,
+        _ => {
+            if format == "tar.gz" {
+                // GNU tar 无 zip 支持，但 tar.gz 一定能写。
+                std::process::Command::new("tar")
+                    .args(["-czf"])
+                    .arg(&archive)
+                    .arg("-C")
+                    .arg(&staging)
+                    .arg(".")
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            } else {
+                std::process::Command::new("zip")
+                    .arg("-r")
+                    .arg(&archive)
+                    .arg(".")
+                    .current_dir(&staging)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            }
+        }
+    };
+    if !ok || !archive.exists() {
+        return Err(format!(
+            "package：生成 {} 失败（需要 bsdtar（macOS/Windows 自带）或 GNU tar / zip）",
+            archive.display()
+        ));
+    }
+    let size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "[ns-build] package -> {}（{:.1} KB）",
+        archive.display(),
+        size as f64 / 1024.0
+    );
     Ok(())
 }
 

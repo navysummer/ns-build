@@ -101,6 +101,9 @@ impl<'a> CompileContext<'a> {
                 cmd.push("-Wextra".into());
             }
         }
+        if t.werror {
+            cmd.push("-Werror".into());
+        }
         // 宏定义。
         for d in &t.defines {
             cmd.push(format!("-D{d}"));
@@ -110,7 +113,7 @@ impl<'a> CompileContext<'a> {
             cmd.push(format!("-I{}", inc.display()));
         }
         // 预编译头（`-include <path>`：必须是两个独立参数）。
-        if let Some(pch) = &t.pch {
+        for pch in &t.pch {
             cmd.push("-include".into());
             cmd.push(pch.clone());
         }
@@ -180,6 +183,9 @@ fn compile_command_msvc(ctx: &CompileContext<'_>, src: &Path, out: &Path) -> Vec
     }
     // 警告。
     cmd.push(if t.warnings { "/W3".into() } else { "/w".into() });
+    if t.werror {
+        cmd.push("/WX".into());
+    }
     // 宏定义。
     for d in &t.defines {
         cmd.push(format!("/D{d}"));
@@ -189,7 +195,7 @@ fn compile_command_msvc(ctx: &CompileContext<'_>, src: &Path, out: &Path) -> Vec
         cmd.push(format!("/I{}", inc.display()));
     }
     // 预编译头（/FI：强制包含，与 -include 等价语义）。
-    if let Some(pch) = &t.pch {
+    for pch in &t.pch {
         cmd.push(format!("/FI{pch}"));
     }
     // 编译标志（原样透传）。
@@ -269,8 +275,8 @@ pub fn link_command(
         cmd.push(o.to_string_lossy().into_owned());
     }
     // 直接链接动态库时写入构建树 rpath，保证未安装前也能运行。
+    let mut rpaths: Vec<PathBuf> = Vec::new();
     if !host.os.is_windows_family() {
-        let mut rpaths: Vec<PathBuf> = Vec::new();
         for o in objs {
             if is_shared_lib(o) {
                 if let Some(parent) = o.parent() {
@@ -282,6 +288,24 @@ pub fn link_command(
         }
         for p in rpaths {
             cmd.push(format!("-Wl,-rpath,{}", p.display()));
+        }
+        // 用户声明的 rpath（如 $ORIGIN/../lib、/usr/local/lib）。
+        for rp in &target.rpath {
+            cmd.push(format!("-Wl,-rpath,{rp}"));
+        }
+        // soversion → soname / install_name（unix；MSVC 没有该概念）。
+        if target.soversion.is_some() {
+            let fname = out
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("lib.so")
+                .to_string();
+            match host.os {
+                crate::platform::Os::Macos | crate::platform::Os::Ios => {
+                    cmd.push(format!("-Wl,-install_name,@rpath/{fname}"))
+                }
+                _ => cmd.push(format!("-Wl,-soname,{fname}")),
+            }
         }
     }
     for l in &target.link {
@@ -583,6 +607,7 @@ mod tests {
             link_flags: vec![],
             defines: vec![],
             deps: vec![],
+            private_deps: vec![],
             output: PathBuf::from(format!("out/{name}")),
             groups: None,
             group_size: None,
@@ -591,13 +616,16 @@ mod tests {
             profile: Profile::Release,
             strip: false,
             warnings: true,
+            werror: false,
+            rpath: vec![],
+            soversion: None,
             install: true,
             language: Language::C,
             c_std: None,
             cxx_std: None,
             pkg_config: vec![],
             when: None,
-            pch: None,
+            pch: vec![],
         }
     }
 
@@ -645,9 +673,84 @@ mod tests {
     }
 
     #[test]
+    fn rpath_flags_emitted() {
+        let mut t = target("a", TargetKind::Exe);
+        t.rpath = vec!["/opt/lib".into(), "$ORIGIN/../lib".into()];
+        let cmd = link_command(
+            &t,
+            &[PathBuf::from("a.o")],
+            &PathBuf::from("a"),
+            Host::current(),
+            Profile::Release,
+        );
+        assert!(cmd.contains(&"-Wl,-rpath,/opt/lib".to_string()));
+        assert!(cmd.contains(&"-Wl,-rpath,$ORIGIN/../lib".to_string()));
+    }
+
+    #[test]
+    fn werror_adds_flag() {
+        let mut t = target("a", TargetKind::Exe);
+        t.werror = true;
+        let cmd = compile_command(
+            &CompileContext {
+                cc: "cc",
+                target: &t,
+                profile: Profile::Release,
+                is_cxx: false,
+            },
+            Path::new("a.c"),
+            Path::new("a.o"),
+            Path::new("a.d"),
+        );
+        assert!(cmd.contains(&"-Werror".to_string()));
+        // MSVC → /WX
+        let mut t2 = target("a", TargetKind::Exe);
+        t2.cc = "cl".into();
+        t2.werror = true;
+        let cmd2 = compile_command(
+            &CompileContext {
+                cc: "cl",
+                target: &t2,
+                profile: Profile::Release,
+                is_cxx: true,
+            },
+            Path::new("a.cpp"),
+            Path::new("a.obj"),
+            Path::new("a.d"),
+        );
+        assert!(cmd2.contains(&"/WX".to_string()));
+    }
+
+    #[test]
+    fn pch_multiple_headers() {
+        let mut t = target("a", TargetKind::Exe);
+        t.pch = vec!["a.h".into(), "b.h".into()];
+        let cmd = compile_command(
+            &CompileContext {
+                cc: "cc",
+                target: &t,
+                profile: Profile::Release,
+                is_cxx: false,
+            },
+            Path::new("a.c"),
+            Path::new("a.o"),
+            Path::new("a.d"),
+        );
+        let includes: Vec<usize> = cmd
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| *c == "-include")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(includes.len(), 2);
+        assert_eq!(cmd[includes[0] + 1], "a.h");
+        assert_eq!(cmd[includes[1] + 1], "b.h");
+    }
+
+    #[test]
     fn pch_uses_two_arguments() {
         let mut t = target("a", TargetKind::Exe);
-        t.pch = Some("include/pre.h".into());
+        t.pch = vec!["include/pre.h".into()];
         let cmd = compile_command(
             &CompileContext {
                 cc: "cc",
@@ -717,7 +820,7 @@ mod tests {
         let mut t = target("a", TargetKind::Exe);
         t.defines = vec!["FOO=1".into(), "BAR".into()];
         t.include_dirs = vec![PathBuf::from("/inc")];
-        t.pch = Some("pch.h".into());
+        t.pch = vec!["pch.h".into()];
         let cmd = compile_command(
             &CompileContext {
                 cc: "cl",
