@@ -89,6 +89,12 @@ pub enum Command {
     Run { program: String, args: Vec<String> },
 }
 
+impl Default for Command {
+    fn default() -> Self {
+        Command::Shell(String::new())
+    }
+}
+
 /// 构建钩子：目标构建前/后运行的自定义命令。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -139,6 +145,16 @@ impl Profile {
             Self::Debug => &["-O0", "-g"],
             Self::RelWithDebInfo => &["-O2", "-g"],
             Self::MinSizeRel => &["-Os"],
+        }
+    }
+
+    /// MSVC 风格优化标志。
+    pub fn msvc_opt_flags(&self) -> &'static [&'static str] {
+        match self {
+            Self::Release => &["/O2"],
+            Self::Debug => &["/Od", "/Zi"],
+            Self::RelWithDebInfo => &["/O2", "/Zi"],
+            Self::MinSizeRel => &["/O1"],
         }
     }
 }
@@ -272,6 +288,83 @@ pub struct Target {
     pub pch: Option<String>,
 
 }
+/// 自定义命令（CMake `add_custom_command(OUTPUT)` 等价）：
+/// 生成文件，供 targets 作为源/输入使用；生命周期与缓存接入与普通任务一致。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomCommand {
+    /// 名字（日志/错误消息；缺省 `custom_<索引>`）。
+    pub name: String,
+    /// 生成的文件（相对脚本目录；建议放 out 目录下，如 `build/gen/version.c`）。
+    pub outputs: Vec<String>,
+    /// 命令：字符串（`sh -c` / `cmd /C`）或 `{ program = "...", args = [...] }`。
+    pub command: Command,
+    /// 输入文件（相对脚本目录，支持 glob）。
+    pub depends: Vec<String>,
+    /// 依赖的其他自定义命令名（先于本命令执行）。
+    pub deps: Vec<String>,
+}
+
+/// 构建预设（CMake `--preset` 等价）：一组可命名的配置覆盖。
+/// 命令行显式传入的选项优先于预设中的值。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Preset {
+    /// 优化配置覆盖。
+    pub profile: Option<Profile>,
+    /// 并行任务数覆盖。
+    pub jobs: Option<usize>,
+    /// 变量覆盖（等价 `--define`，CLI 中显式 --define 优先）。
+    pub defines: BTreeMap<String, String>,
+    /// unity 模式覆盖（`off` / `on` / `auto`）。
+    pub unity: Option<String>,
+    /// 默认工具链覆盖（`[[toolchains]].name`）。
+    pub toolchain: Option<String>,
+    /// 警告标志覆盖。
+    pub warnings: Option<bool>,
+}
+
+/// 外部依赖拉取（CMake FetchContent / ExternalProject 等价）。
+/// 由 `ns-build fetch` 执行；构建本身不需要网络。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Fetch {
+    /// 包名（拉取到 `.ns-fetch/<name>/`）；仅字母数字/`-`/`_`。
+    pub name: String,
+    /// git 仓库地址（支持本地 `file://`，便于离线/测试）。
+    pub git: Option<String>,
+    /// 版本、分支或提交（仅 git；默认远程 HEAD）。
+    pub rev: Option<String>,
+    /// 压缩包地址（`.tar.gz`/`.tgz`/`.tar`/`.zip`；支持本地 `file://`）。
+    pub url: Option<String>,
+    /// 解压时去掉的目录层数（仅 tar；默认 0）。
+    pub strip_components: usize,
+}
+
+/// 安装包导出（CMake `install(EXPORT)` 等价）：生成 `<name>-config.toml`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Export {
+    /// 导出包名（配置文件名 `<name>-config.toml`）。
+    pub name: String,
+    /// 导出的 target；空 = 所有 `install = true` 的 `static`/`lib`/`module` 目标。
+    pub targets: Vec<String>,
+    /// 安装目录（相对 prefix）；默认 `lib/cmake/<name>`。
+    pub to: String,
+    /// 包版本；默认 `project.version`。
+    pub version: String,
+}
+
+/// 导入已安装的包（CMake `find_package` 等价）：其使用要求并入所有目标。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Import {
+    /// 前缀目录、配置文件路径或包含 `<name>-config.toml` 的目录。
+    pub from: String,
+    /// 包名（`from` 是目录时必填；`from` 是文件时可从文件名推断）。
+    pub name: String,
+}
+
 /// 头文件安装规则。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -315,6 +408,16 @@ pub struct BuildScript {
     pub targets: Vec<Target>,
     /// 子脚本（`include = ["sub/ns-build.toml"]`）。
     pub includes: Vec<String>,
+    /// 自定义命令（`[[custom_commands]]`）。
+    pub custom_commands: Vec<CustomCommand>,
+    /// 安装导出（`[[exports]]`）。
+    pub exports: Vec<Export>,
+    /// 导入已安装的包（`[[imports]]`）。
+    pub imports: Vec<Import>,
+    /// 外部依赖拉取（`[[fetch]]`）。
+    pub fetch: Vec<Fetch>,
+    /// 构建预设（`[presets]` 表，CMake `--preset` 等价）。
+    pub presets: BTreeMap<String, Preset>,
     /// 头文件安装规则（`[[install_headers]]`）。
     pub install_headers: Vec<InstallHeader>,
     /// 通用文件安装规则（`[[install_files]]`）。
@@ -385,6 +488,16 @@ pub struct ResolvedTarget {
     pub pch: Option<String>,
 }
 
+/// 自定义命令解析结果（路径已绝对化、glob 已展开、命令已做变量替换）。
+#[derive(Debug, Clone)]
+pub struct ResolvedCustomCommand {
+    pub name: String,
+    pub outputs: Vec<PathBuf>,
+    pub command: Command,
+    pub depends: Vec<PathBuf>,
+    pub deps: Vec<String>,
+}
+
 /// 解析后的完整脚本（路径已相对脚本目录解析、glob 已展开、平台过滤已应用）。
 #[derive(Debug, Clone)]
 pub struct ResolvedScript {
@@ -393,6 +506,8 @@ pub struct ResolvedScript {
     pub out_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub targets: Vec<ResolvedTarget>,
+    /// 自定义命令（按声明顺序；产物路径供 targets 的 sources 引用）。
+    pub custom_commands: Vec<ResolvedCustomCommand>,
     pub parallel: usize,
     pub host: Host,
 }
@@ -404,7 +519,12 @@ struct ResolveContext<'a> {
     host: &'a Host,
     vars: &'a BTreeMap<String, String>,
     cli_profile: Option<Profile>,
-    interfaces: &'a BTreeMap<String, (Vec<PathBuf>, Vec<String>)>,
+    /// 所有自定义命令声明的产物路径（target 的 sources 可引用，存在性不查）。
+    custom_outputs: &'a BTreeSet<PathBuf>,
+    /// 来自 imports 的使用要求（全局并入）。
+    import_includes: &'a [PathBuf],
+    import_defines: &'a [String],
+    import_link: &'a [String],
 }
 
 impl BuildScript {
@@ -424,6 +544,18 @@ impl BuildScript {
         dir: &Path,
         overrides: &BTreeMap<String, String>,
         cli_profile: Option<Profile>,
+    ) -> Result<ResolvedScript, String> {
+        self.resolve_impl(dir, overrides, cli_profile, &BTreeSet::new())
+    }
+
+    /// `inherited_customs`：父脚本中自定义命令声明的产物（供 include 子脚本
+    /// 在 source 存在性检查时识别跨文件生成源）。
+    fn resolve_impl(
+        &self,
+        dir: &Path,
+        overrides: &BTreeMap<String, String>,
+        cli_profile: Option<Profile>,
+        inherited_customs: &BTreeSet<PathBuf>,
     ) -> Result<ResolvedScript, String> {
         let dir = dir
             .canonicalize()
@@ -447,41 +579,230 @@ impl BuildScript {
         vars.entry("project".into()).or_insert_with(|| self.project.name.clone());
         vars.entry("out".into()).or_insert_with(|| self.project.out.clone());
 
-        // INTERFACE 头文件库：收集 include_dirs/defines，供依赖者合并。
-        let mut interfaces: BTreeMap<String, (Vec<PathBuf>, Vec<String>)> = BTreeMap::new();
-        for t in &self.targets {
-            if t.kind != TargetKind::Interface {
-                continue;
+        // imports：已安装的包（find_package 等价），使用要求全局并入所有目标。
+        let mut import_includes: Vec<PathBuf> = Vec::new();
+        let mut import_defines: Vec<String> = Vec::new();
+        let mut import_link: Vec<String> = Vec::new();
+        for imp in &self.imports {
+            if imp.from.trim().is_empty() {
+                return Err("import：from 不能为空".into());
             }
-            let incs = t
-                .include_dirs
-                .iter()
-                .map(|s| dir.join(substitute_vars(s, &vars)))
-                .collect();
-            let defs = t.defines.iter().map(|s| substitute_vars(s, &vars)).collect();
-            interfaces.insert(t.name.clone(), (incs, defs));
+            let loaded = crate::export::load_import(&dir, &imp.from, imp.name.trim())?;
+            let pfx = &loaded.prefix;
+            for t in &loaded.config.targets {
+                for i in &t.include_dirs {
+                    let p = Path::new(i);
+                    let p = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        pfx.join(p)
+                    };
+                    if !import_includes.contains(&p) {
+                        import_includes.push(p);
+                    }
+                }
+                for d in &t.defines {
+                    if !import_defines.contains(d) {
+                        import_defines.push(d.clone());
+                    }
+                }
+                // 产物：以绝对路径参与链接（如同 install 后的静态库路径）。
+                if !t.output.is_empty() {
+                    let artifact = pfx.join("lib").join(&t.output);
+                    let s = artifact.to_string_lossy().into_owned();
+                    if artifact.is_file() && !import_link.contains(&s) {
+                        import_link.push(s);
+                    }
+                }
+                // 记录的 -l 名字 / 路径。
+                for l in &t.link {
+                    if looks_like_lib_name(l) {
+                        if !import_link.contains(l) {
+                            import_link.push(l.clone());
+                        }
+                        continue;
+                    }
+                    let p = Path::new(l);
+                    let s = if p.is_absolute() {
+                        l.clone()
+                    } else {
+                        pfx.join(l).to_string_lossy().into_owned()
+                    };
+                    if !import_link.contains(&s) {
+                        import_link.push(s);
+                    }
+                }
+            }
         }
-        let mut targets = Vec::new();
-        for t in &self.targets {
-            let ctx = ResolveContext {
-                dir: &dir,
-                out_dir: &out_dir,
-                host: &host,
-                vars: &vars,
-                cli_profile,
-                interfaces: &interfaces,
+
+        // 自定义命令：第一遍只收集 outputs（含父脚本继承的），
+        // 第二遍解析 depends/命令（这样 depends 可以引用任意顺序声明的产物）。
+        let mut custom_outputs: BTreeSet<PathBuf> = inherited_customs.clone();
+        let mut seen_custom: BTreeSet<String> = BTreeSet::new();
+        let mut resolved_names: Vec<String> = Vec::with_capacity(self.custom_commands.len());
+        for (i, cc) in self.custom_commands.iter().enumerate() {
+            let name = if cc.name.is_empty() {
+                format!("custom_{i}")
+            } else {
+                cc.name.clone()
             };
-            if let Some(r) = self.resolve_target(t, &ctx)? {
-                targets.push(r);
+            if !seen_custom.insert(name.clone()) {
+                return Err(format!("custom_commands 名重复: '{name}'"));
+            }
+            if cc.outputs.is_empty() {
+                return Err(format!("custom_command '{name}': outputs 不能为空"));
+            }
+            let mut outputs: Vec<PathBuf> = Vec::new();
+            for o in &cc.outputs {
+                let o = substitute_vars(o, &vars);
+                if o.trim().is_empty() {
+                    return Err(format!("custom_command '{name}': outputs 含空路径"));
+                }
+                let p = if Path::new(&o).is_absolute() {
+                    PathBuf::from(&o)
+                } else {
+                    dir.join(&o)
+                };
+                if !outputs.contains(&p) && !custom_outputs.insert(p.clone()) {
+                    return Err(format!(
+                        "custom_command '{name}': 产物重复声明: {}",
+                        p.display()
+                    ));
+                }
+                if !outputs.contains(&p) {
+                    outputs.push(p);
+                }
+            }
+            resolved_names.push(name);
+        }
+
+        let mut custom_commands: Vec<ResolvedCustomCommand> = Vec::new();
+        for (i, cc) in self.custom_commands.iter().enumerate() {
+            let name = resolved_names[i].clone();
+            // outputs 重新绝对化（第二遍）。
+            let mut outputs: Vec<PathBuf> = Vec::new();
+            for o in &cc.outputs {
+                let o = substitute_vars(o, &vars);
+                let p = if Path::new(&o).is_absolute() {
+                    PathBuf::from(&o)
+                } else {
+                    dir.join(&o)
+                };
+                if !outputs.contains(&p) {
+                    outputs.push(p);
+                }
+            }
+            // depends：字面量路径必须存在；支持 glob。
+            let mut depends: Vec<PathBuf> = Vec::new();
+            for d in &cc.depends {
+                let d = substitute_vars(d, &vars);
+                let p = if Path::new(&d).is_absolute() {
+                    PathBuf::from(&d)
+                } else {
+                    dir.join(&d)
+                };
+                let s = p.to_string_lossy().to_string();
+                if s.contains('*') || s.contains('?') {
+                    let mut matched = false;
+                    for entry in glob::glob(&s)
+                        .map_err(|e| format!("custom_command '{name}': depends glob 错误 {d}: {e}"))?
+                    {
+                        let path = entry
+                            .map_err(|e| format!("custom_command '{name}': depends 遍历错误: {e}"))?;
+                        if path.is_file() {
+                            depends.push(path);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        return Err(format!(
+                            "custom_command '{name}': depends '{d}' 无匹配文件"
+                        ));
+                    }
+                } else if p.is_file() {
+                    depends.push(p);
+                } else if custom_outputs.contains(&p) {
+                    // depends 的是另一个自定义命令将生成的文件：不做存在性检查，
+                    // 构建时会按 deps 顺序先生成它。
+                    depends.push(p);
+                } else {
+                    return Err(format!(
+                        "custom_command '{name}': depends 文件不存在: {}",
+                        p.display()
+                    ));
+                }
+            }
+            depends.sort();
+            depends.dedup();
+            // 命令变量替换。
+            let command = match &cc.command {
+                Command::Shell(s) => {
+                    let s = substitute_vars(s, &vars);
+                    if s.trim().is_empty() {
+                        return Err(format!("custom_command '{name}': command 不能为空"));
+                    }
+                    Command::Shell(s)
+                }
+                Command::Run { program, args } => Command::Run {
+                    program: substitute_vars(program, &vars),
+                    args: args.iter().map(|a| substitute_vars(a, &vars)).collect(),
+                },
+            };
+            custom_commands.push(ResolvedCustomCommand {
+                name,
+                outputs,
+                command,
+                depends,
+                deps: cc.deps.clone(),
+            });
+        }
+        // 校验 deps 引用存在。
+        for cc in &custom_commands {
+            for d in &cc.deps {
+                if !seen_custom.contains(d) {
+                    return Err(format!(
+                        "custom_command '{}' 依赖不存在的自定义命令 '{}'",
+                        cc.name, d
+                    ));
+                }
             }
         }
-        // include 子脚本：递归加载，targets 合并（路径相对子脚本目录）。
+
+        // include 子脚本：先于本文件的 targets 合并（路径相对子脚本目录），
+        // 子脚本的自定义命令产物也并入存在性检查集合。
+        let mut targets: Vec<ResolvedTarget> = Vec::new();
         for inc in &self.includes {
             let inc_path = dir.join(inc);
             let (sub_script, sub_dir) = load(&inc_path)?;
-            let sub_resolved = sub_script.resolve(&sub_dir, overrides, cli_profile)?;
+            let sub_resolved =
+                sub_script.resolve_impl(&sub_dir, overrides, cli_profile, &custom_outputs)?;
+            for cc in sub_resolved.custom_commands {
+                if !seen_custom.insert(cc.name.clone()) {
+                    return Err(format!("custom_commands 名重复: '{}'", cc.name));
+                }
+                custom_outputs.extend(cc.outputs.iter().cloned());
+                custom_commands.push(cc);
+            }
             for t in sub_resolved.targets {
                 targets.push(t);
+            }
+        }
+
+        // INTERFACE 头文件库：依赖者使用要求由 propagate_usage 全局传递。
+        let ctx = ResolveContext {
+            dir: &dir,
+            out_dir: &out_dir,
+            host: &host,
+            vars: &vars,
+            cli_profile,
+            custom_outputs: &custom_outputs,
+            import_includes: &import_includes,
+            import_defines: &import_defines,
+            import_link: &import_link,
+        };
+        for t in &self.targets {
+            if let Some(r) = self.resolve_target(t, &ctx)? {
+                targets.push(r);
             }
         }
         // 依赖目标的公开使用要求（include / defines / link）向下游传递。
@@ -492,6 +813,7 @@ impl BuildScript {
             out_dir,
             cache_dir,
             targets,
+            custom_commands,
             parallel,
             host,
         })
@@ -537,7 +859,10 @@ impl BuildScript {
             host,
             vars,
             cli_profile,
-            interfaces,
+            custom_outputs,
+            import_includes,
+            import_defines,
+            import_link,
         } = *ctx;
         if t.name.is_empty() {
             return Err("target 缺少 name".into());
@@ -641,6 +966,11 @@ impl BuildScript {
                 if seen.insert(p.clone()) {
                     sources.push(p);
                 }
+            } else if custom_outputs.contains(&p) {
+                // 自定义命令将生成该文件（构建时先于编译执行）。
+                if seen.insert(p.clone()) {
+                    sources.push(p);
+                }
             } else {
                 return Err(format!("源文件不存在: {}", p.display()));
             }
@@ -687,10 +1017,20 @@ impl BuildScript {
 
         let mut defines = vec![];
         defines.extend(self.defaults.defines.iter().map(|f| sub(f)));
+        for d in import_defines {
+            if !defines.contains(d) {
+                defines.push(d.clone());
+            }
+        }
         defines.extend(t.defines.iter().map(|f| sub(f)));
 
         let mut link = vec![];
         link.extend(t.link.iter().map(|f| sub(f)));
+        for l in import_link {
+            if !link.contains(l) {
+                link.push(l.clone());
+            }
+        }
         let mut link_flags = vec![];
         link_flags.extend(toolchain_link);
         link_flags.extend(t.link_flags.iter().map(|f| sub(f)));
@@ -729,23 +1069,14 @@ impl BuildScript {
             .iter()
             .map(|s| dir.join(sub(s)))
             .collect();
-        incs.extend(t.include_dirs.iter().map(|s| dir.join(sub(s))));
-        incs.extend(toolchain_incs.iter().map(|s| dir.join(sub(s))));
-        // INTERFACE 依赖：合并头文件库的 include_dirs/defines。
-        for dep in &t.deps {
-            if let Some((d_incs, d_defs)) = interfaces.get(dep) {
-                for i in d_incs {
-                    if !incs.contains(i) {
-                        incs.push(i.clone());
-                    }
-                }
-                for d in d_defs {
-                    if !defines.contains(d) {
-                        defines.push(d.clone());
-                    }
-                }
+        for i in import_includes {
+            if !incs.contains(i) {
+                incs.push(i.clone());
             }
         }
+        incs.extend(t.include_dirs.iter().map(|s| dir.join(sub(s))));
+        incs.extend(toolchain_incs.iter().map(|s| dir.join(sub(s))));
+        // INTERFACE 使用要求（include_dirs/defines）由 propagate_usage 全局传递。
 
         Ok(Some(ResolvedTarget {
             name: t.name.clone(),
@@ -871,6 +1202,18 @@ fn merge_unique<T: PartialEq + Clone>(dst: &mut Vec<T>, src: &[T]) -> bool {
         }
     }
     changed
+}
+
+/// 判断字符串是否像库名（`-l` 风格：无分隔符、无常见库文件后缀）。
+fn looks_like_lib_name(l: &str) -> bool {
+    !l.contains('/')
+        && !l.contains('\\')
+        && !l.starts_with('-')
+        && !l.ends_with(".a")
+        && !l.ends_with(".so")
+        && !l.ends_with(".dylib")
+        && !l.ends_with(".lib")
+        && !l.ends_with(".dll")
 }
 
 /// 替换字符串中的 `${name}` 变量（保留未定义变量，按 UTF-8 字符安全处理）。

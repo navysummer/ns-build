@@ -6,6 +6,7 @@ pub mod cache;
 pub mod compiler;
 pub mod depfile;
 pub mod executor;
+pub mod export;
 pub mod fsutil;
 pub mod graph;
 pub mod install;

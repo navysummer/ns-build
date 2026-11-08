@@ -28,6 +28,8 @@ pub struct Node {
     pub depfile: Option<std::path::PathBuf>,
     /// 产物。
     pub output: std::path::PathBuf,
+    /// 额外产物（自定义命令可产出多个文件；普通任务为空）。
+    pub extra_outputs: Vec<std::path::PathBuf>,
     /// 完整外部命令。
     pub command: Vec<String>,
     /// 允许并行。
@@ -150,6 +152,7 @@ mod tests {
             inputs: vec![],
             depfile: None,
             output: std::path::PathBuf::new(),
+            extra_outputs: vec![],
             command: vec![],
             parallel: true,
             label: key.into(),

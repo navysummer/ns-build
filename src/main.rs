@@ -20,6 +20,8 @@ const USAGE: &str = r#"ns-build — 现代化跨平台构建系统
   ns-build run <目标> [-- 参数...]
   ns-build show
   ns-build graph
+  ns-build presets
+  ns-build fetch [--update]
   ns-build init [--name <名>]
 
 选项:
@@ -27,6 +29,7 @@ const USAGE: &str = r#"ns-build — 现代化跨平台构建系统
   --release           优化构建 (默认)
   --debug             调试构建
   --profile <配置>    release | debug | relwithdebinfo | minsizerel
+  --preset <名字>     应用 [presets] 中的命名预设（命令行显式选项优先）
   --verbose           打印完整命令
   --quiet             只输出错误
   -h, --help          帮助
@@ -59,6 +62,8 @@ fn run(args: &[String]) -> Result<(), String> {
         "show" => cmd_show(),
         "graph" => cmd_graph(),
         "init" => cmd_init(&args[1..]),
+        "presets" => cmd_presets(),
+        "fetch" => cmd_fetch(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
@@ -81,6 +86,8 @@ struct BuildArgs {
     targets: Vec<String>,
     /// CLI 变量覆盖：`--define name=value`。
     defines: std::collections::BTreeMap<String, String>,
+    /// `--preset <name>`：应用 `[presets]` 中的命名预设。
+    preset: Option<String>,
 }
 
 fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
@@ -92,6 +99,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
         verbose: false,
         targets: vec![],
         defines: std::collections::BTreeMap::new(),
+        preset: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -119,10 +127,17 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
             }
             "--quiet" | "-q" => out.quiet = true,
             "--verbose" | "-v" => out.verbose = true,
-            t if t.starts_with("--define") => {
-                let v = t.strip_prefix("--define=")
-                    .or_else(|| t.strip_prefix("--define"))
-                    .unwrap_or("");
+            "--define" => {
+                i += 1;
+                let v = args.get(i).ok_or("--define 需要 name=value")?;
+                if let Some((name, value)) = v.split_once('=') {
+                    out.defines.insert(name.to_string(), value.to_string());
+                } else {
+                    out.defines.insert(v.to_string(), "1".to_string());
+                }
+            }
+            t if t.starts_with("--define=") => {
+                let v = &t["--define=".len()..];
                 if let Some((name, value)) = v.split_once('=') {
                     out.defines.insert(name.to_string(), value.to_string());
                 } else if !v.is_empty() {
@@ -130,6 +145,14 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
                 } else {
                     return Err("--define 需要 name=value".into());
                 }
+            }
+            "--preset" => {
+                i += 1;
+                let v = args.get(i).ok_or("--preset 需要预设名")?;
+                out.preset = Some(v.clone());
+            }
+            t if t.starts_with("--preset=") => {
+                out.preset = Some(t["--preset=".len()..].to_string());
             }
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -189,6 +212,42 @@ fn expand_targets(
             }
         }
     }
+    // 展开生成源引用的自定义命令（及其自身的依赖）：
+    // 目标过滤时不能把生成步骤一起裁掉。
+    if !script.custom_commands.is_empty() {
+        let mut needed: BTreeSet<String> = BTreeSet::new();
+        for name in &allowed {
+            if let Some(t) = by_name.get(name.as_str()) {
+                for src in &t.sources {
+                    for cc in &script.custom_commands {
+                        if cc.outputs.iter().any(|o| o == src) {
+                            needed.insert(cc.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // fixpoint：自定义命令自身的 deps 也必须保留。
+        let by_custom: BTreeMap<&str, &ns_build::script::ResolvedCustomCommand> = script
+            .custom_commands
+            .iter()
+            .map(|cc| (cc.name.as_str(), cc))
+            .collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for cc in &script.custom_commands {
+                if needed.contains(&cc.name) {
+                    for d in &cc.deps {
+                        if by_custom.contains_key(d.as_str()) && needed.insert(d.clone()) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        allowed.extend(needed);
+    }
     Ok(allowed.into_iter().collect())
 }
 
@@ -198,6 +257,41 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let ba = parse_build_args(args)?;
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
+    let mut ba = ba;
+    let mut script = script;
+    // 应用 --preset：预设中的值优先级低于命令行显式选项。
+    if let Some(name) = &ba.preset {
+        let p = script
+            .presets
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                let avail = if script.presets.is_empty() {
+                    "无".to_string()
+                } else {
+                    script.presets.keys().cloned().collect::<Vec<_>>().join(", ")
+                };
+                format!("未知预设 '{name}'（可选：{avail}）")
+            })?;
+        if let Some(t) = &p.toolchain {
+            script.defaults.toolchain = Some(t.clone());
+        }
+        if let Some(u) = &p.unity {
+            script.defaults.unity = u.clone();
+        }
+        if let Some(w) = p.warnings {
+            script.defaults.warnings = w;
+        }
+        if ba.profile.is_none() {
+            ba.profile = p.profile;
+        }
+        if ba.jobs.is_none() {
+            ba.jobs = p.jobs;
+        }
+        for (k, v) in p.defines {
+            ba.defines.entry(k).or_insert(v);
+        }
+    }
     let resolved = script.resolve(&script_dir, &ba.defines, ba.profile)?;
     // 指定目标时自动包含其（递归）依赖。
     let targets = if ba.targets.is_empty() {
@@ -279,6 +373,15 @@ fn cmd_test(args: &[String]) -> Result<(), String> {
                 profile_args.push(
                     args.get(i).ok_or("--profile 需要参数")?.clone(),
                 );
+            }
+            "--preset" => {
+                i += 1;
+                profile_args.push("--preset".into());
+                profile_args.push(args.get(i).ok_or("--preset 需要预设名")?.clone());
+            }
+            v if v.starts_with("--preset=") => {
+                profile_args.push("--preset".into());
+                profile_args.push(v["--preset=".len()..].to_string());
             }
             "--verbose" | "-v" => {
                 verbose = true;
@@ -416,6 +519,214 @@ fn cmd_show() -> Result<(), String> {
             t.output.display()
         );
     }
+    Ok(())
+}
+
+fn profile_name(p: &ns_build::script::Profile) -> &'static str {
+    use ns_build::script::Profile::*;
+    match p {
+        Release => "release",
+        Debug => "debug",
+        RelWithDebInfo => "relwithdebinfo",
+        MinSizeRel => "minsizerel",
+    }
+}
+
+fn cmd_presets() -> Result<(), String> {
+    let dir = std::env::current_dir().map_err(|e| e.to_string())?;
+    let (script, _) = load(&dir)?;
+    if script.presets.is_empty() {
+        println!("[ns-build] 未定义预设（在 ns-build.toml 的 [presets] 节中定义）");
+        return Ok(());
+    }
+    println!("[ns-build] 可用预设：");
+    for (name, p) in &script.presets {
+        println!("  {name}");
+        if let Some(profile) = &p.profile {
+            println!("    profile = {}", profile_name(profile));
+        }
+        if let Some(j) = p.jobs {
+            println!("    jobs = {j}");
+        }
+        if let Some(u) = &p.unity {
+            println!("    unity = {u}");
+        }
+        if let Some(t) = &p.toolchain {
+            println!("    toolchain = {t}");
+        }
+        if let Some(w) = p.warnings {
+            println!("    warnings = {w}");
+        }
+        if !p.defines.is_empty() {
+            let ds = p
+                .defines
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("    defines = {ds}");
+        }
+    }
+    Ok(())
+}
+
+/// 拉取 `[[fetch]]` 外部依赖到 `.ns-fetch/<name>/`。
+/// 默认已存在则跳过；`--update` 强制重新拉取。
+fn cmd_fetch(args: &[String]) -> Result<(), String> {
+    let mut update = false;
+    for a in args {
+        match a.as_str() {
+            "--update" | "-u" => update = true,
+            v => return Err(format!("未知选项 '{v}'（ns-build fetch [--update]）")),
+        }
+    }
+    let dir = std::env::current_dir().map_err(|e| e.to_string())?;
+    let (script, _) = load(&dir)?;
+    if script.fetch.is_empty() {
+        println!("[ns-build] 未定义 [[fetch]]（ns-build.toml）");
+        return Ok(());
+    }
+    let fetch_root = dir.join(".ns-fetch");
+    std::fs::create_dir_all(&fetch_root)
+        .map_err(|e| format!("创建 {} 失败: {e}", fetch_root.display()))?;
+    for f in &script.fetch {
+        fetch_one(f, &fetch_root, update)?;
+    }
+    println!("[ns-build] fetch 完成");
+    Ok(())
+}
+
+fn fetch_one(f: &ns_build::script::Fetch, fetch_root: &std::path::Path, update: bool) -> Result<(), String> {
+    let name = f.name.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!(
+            "fetch：name '{name}' 非法（仅字母数字 / '-' / '_' / '.'）"
+        ));
+    }
+    let dest = fetch_root.join(name);
+    if dest.exists() {
+        if !update {
+            println!("[ns-build] 跳过 {name}（已存在；--update 强制更新）");
+            return Ok(());
+        }
+        if dest.is_dir() {
+            std::fs::remove_dir_all(&dest)
+                .map_err(|e| format!("删除 {} 失败: {e}", dest.display()))?;
+        } else {
+            std::fs::remove_file(&dest)
+                .map_err(|e| format!("删除 {} 失败: {e}", dest.display()))?;
+        }
+    }
+    match (&f.git, &f.url) {
+        (Some(_), Some(_)) => Err(format!("fetch '{name}'：git 与 url 只能二选一")),
+        (None, None) => Err(format!("fetch '{name}'：需要 git 或 url")),
+        (Some(git), None) => fetch_git(name, git, f.rev.as_deref(), &dest),
+        (None, Some(url)) => fetch_url(name, url, f.strip_components, &dest),
+    }
+}
+
+fn fetch_git(name: &str, git: &str, rev: Option<&str>, dest: &std::path::Path) -> Result<(), String> {
+    let run = |args: &[&str]| -> Result<bool, String> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|e| format!("运行 git 失败: {e}"))?;
+        Ok(out.status.success())
+    };
+    let dest_s = dest.to_string_lossy().into_owned();
+    println!("[ns-build] 拉取 git {git} -> {}", dest.display());
+    let ok = match rev {
+        // 先尝试浅克隆指定分支/标签；失败则完整克隆后 checkout。
+        Some(r) => {
+            if run(&["clone", "--depth", "1", "--branch", r, git, &dest_s])? {
+                true
+            } else {
+                if dest.exists() {
+                    let _ = std::fs::remove_dir_all(dest);
+                }
+                run(&["clone", git, &dest_s])? && run(&["-C", &dest_s, "checkout", r])?
+            }
+        }
+        None => run(&["clone", "--depth", "1", git, &dest_s])?,
+    };
+    if !ok {
+        return Err(format!("fetch '{name}'：git 拉取失败（{git}）"));
+    }
+    let manifest = format!("source = \"git\"\nurl = \"{git}\"\nrev = {rev:?}\n");
+    std::fs::write(dest.join(".ns-fetch.toml"), manifest)
+        .map_err(|e| format!("fetch '{name}'：写入清单失败: {e}"))?;
+    println!("[ns-build] 已拉取 {name}");
+    Ok(())
+}
+
+fn fetch_url(name: &str, url: &str, strip_components: usize, dest: &std::path::Path) -> Result<(), String> {
+    println!("[ns-build] 下载 {url} -> {}", dest.display());
+    std::fs::create_dir_all(dest).map_err(|e| format!("创建 {} 失败: {e}", dest.display()))?;
+    // 下载到临时文件（系统 temp 目录下，按进程隔离）。
+    let tmp = std::env::temp_dir().join(format!(
+        "ns-fetch-{}-{}",
+        std::process::id(),
+        url.rsplit('/').next().unwrap_or("archive")
+    ));
+    let st = std::process::Command::new("curl")
+        .args(["-sfL", url, "-o"])
+        .arg(&tmp)
+        .status()
+        .map_err(|e| format!("运行 curl 失败: {e}"))?;
+    if !st.success() {
+        return Err(format!("fetch '{name}'：下载失败（{url}）"));
+    }
+    let lower = url.to_lowercase();
+    let is_zip = lower.ends_with(".zip");
+    let is_tgz = lower.ends_with(".tar.gz") || lower.ends_with(".tgz");
+    let is_tar = lower.ends_with(".tar") || is_tgz;
+    let extract_ok = if is_zip {
+        if strip_components > 0 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "fetch '{name}'：zip 不支持 strip_components（请用 tar 或预处理）"
+            ));
+        }
+        std::process::Command::new("unzip")
+            .arg("-q")
+            .arg(&tmp)
+            .arg("-d")
+            .arg(dest)
+            .status()
+            .map_err(|e| format!("运行 unzip 失败: {e}"))?
+            .success()
+    } else if is_tar {
+        let mut args: Vec<String> = vec![if is_tgz { "-zxf".into() } else { "-xf".into() }];
+        args.push(tmp.to_string_lossy().into_owned());
+        args.push("-C".into());
+        args.push(dest.to_string_lossy().into_owned());
+        if strip_components > 0 {
+            args.push("--strip-components".into());
+            args.push(strip_components.to_string());
+        }
+        std::process::Command::new("tar")
+            .args(&args)
+            .status()
+            .map_err(|e| format!("运行 tar 失败: {e}"))?
+            .success()
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "fetch '{name}'：无法识别的压缩包格式（{url}，支持 .tar.gz/.tgz/.tar/.zip）"
+        ));
+    };
+    let _ = std::fs::remove_file(&tmp);
+    if !extract_ok {
+        return Err(format!("fetch '{name}'：解压失败（{url}）"));
+    }
+    let manifest = format!("source = \"url\"\nurl = \"{url}\"\nstrip_components = {strip_components}\n");
+    std::fs::write(dest.join(".ns-fetch.toml"), manifest)
+        .map_err(|e| format!("fetch '{name}'：写入清单失败: {e}"))?;
+    println!("[ns-build] 已拉取 {name}");
     Ok(())
 }
 

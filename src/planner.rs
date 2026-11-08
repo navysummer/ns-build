@@ -60,6 +60,51 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
     let out_dir = &script.out_dir;
     let obj_dir = out_dir.join("obj");
 
+    // 第零遍：自定义命令节点（生成生成文件，targets 引用其产物）。
+    let mut custom_by_out: BTreeMap<PathBuf, NodeId> = BTreeMap::new();
+    let mut custom_by_name: BTreeMap<String, NodeId> = BTreeMap::new();
+    for cc in &script.custom_commands {
+        let argv = command_argv(&cc.command, &script.host);
+        let cmd_hash = hash_cmd(&argv);
+        let key = format!("custom:{}", cc.name);
+        let cached = cache.hit(&key, &cc.depends, &cmd_hash);
+        if cached {
+            skipped += 1;
+        }
+        let out0 = cc.outputs.first().cloned().unwrap_or_default();
+        let node = Node {
+            id: 0,
+            key,
+            kind: TaskKind::Command,
+            inputs: cc.depends.clone(),
+            depfile: None,
+            output: out0,
+            extra_outputs: cc.outputs.iter().skip(1).cloned().collect(),
+            command: argv,
+            parallel: true,
+            label: format!("GEN {}", cc.name),
+            cached,
+        };
+        let nid = graph.add_node(node);
+        for o in &cc.outputs {
+            custom_by_out.insert(o.clone(), nid);
+        }
+        custom_by_name.insert(cc.name.clone(), nid);
+    }
+    // 自定义命令之间的依赖（按名称）。
+    for cc in &script.custom_commands {
+        let id = custom_by_name[&cc.name];
+        for d in &cc.deps {
+            let Some(&dep_id) = custom_by_name.get(d) else {
+                return Err(format!(
+                    "custom_command '{}' 依赖不存在的自定义命令 '{}'",
+                    cc.name, d
+                ));
+            };
+            graph.add_dep(id, dep_id);
+        }
+    }
+
     // 第一遍：为每个 target 生成对象编译节点（含 unity）。
     let mut obj_nodes: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
     for t in &script.targets {
@@ -79,10 +124,13 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
             unity_mode: &script.script.defaults.unity,
             parallel: script.parallel,
         };
-        let objs = plan_object_nodes(t, &ctx, cache, &mut skipped)?;
+        let objs = plan_object_nodes(t, &ctx, cache, &mut skipped, &custom_by_out)?;
         let mut ids = Vec::new();
-        for n in objs {
+        for (n, customs) in objs {
             let id = graph.add_node(n);
+            for c in customs {
+                graph.add_dep(id, c);
+            }
             ids.push(id);
         }
         obj_nodes.insert(t.name.clone(), ids);
@@ -109,6 +157,7 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
                     inputs: vec![],
                     depfile: None,
                     output: PathBuf::new(),
+                    extra_outputs: vec![],
                     command: vec![],
                     parallel: false,
                     label: format!("{kind_name} {}", t.name),
@@ -129,6 +178,11 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
                 } else {
                     // 非 C/C++：object 也走链接/打包任务。
                     let link_id = make_simple_link(t, cache, &mut graph, &mut skipped)?;
+                    for s in &t.sources {
+                        if let Some(&c) = custom_by_out.get(s) {
+                            graph.add_dep(link_id, c);
+                        }
+                    }
                     outputs.insert(t.name.clone(), link_id);
                 }
             }
@@ -197,6 +251,7 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
                     inputs: link_inputs.clone(),
                     depfile: None,
                     output: link_task.output.clone(),
+                    extra_outputs: vec![],
                     command: link_task.command.clone(),
                     parallel: t.parallel,
                     label: link_task.label.clone(),
@@ -205,6 +260,11 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
                 let link_id = graph.add_node(link_node);
                 for &o in &node_inputs {
                     graph.add_dep(link_id, o);
+                }
+                for s in &t.sources {
+                    if let Some(&c) = custom_by_out.get(s) {
+                        graph.add_dep(link_id, c);
+                    }
                 }
                 outputs.insert(t.name.clone(), link_id);
             }
@@ -254,19 +314,21 @@ struct ObjCompileCtx<'a> {
 }
 
 /// 为可链接/分步 target 规划对象编译节点。
+/// 返回 (节点, 其依赖的自定义命令节点) 列表。
 fn plan_object_nodes(
     t: &ResolvedTarget,
     ctx: &ObjCompileCtx<'_>,
     cache: &Cache,
     skipped: &mut usize,
-) -> Result<Vec<Node>, String> {
+    custom_by_out: &BTreeMap<PathBuf, NodeId>,
+) -> Result<Vec<(Node, Vec<NodeId>)>, String> {
     let ObjCompileCtx {
         obj_dir,
         out_dir,
         unity_mode,
         parallel,
     } = *ctx;
-    let mut nodes = Vec::new();
+    let mut nodes: Vec<(Node, Vec<NodeId>)> = Vec::new();
     if t.sources.is_empty() {
         // 纯依赖 target（如只链接依赖的对象）。
         return Ok(nodes);
@@ -288,6 +350,7 @@ fn plan_object_nodes(
             let unity_src = unity_dir.join(format!("{}_{}.{ext}", safe_name(&t.name), gi));
             let _ = std::fs::write(&unity_src, unity_source_content(chunk));
             let compiler = if chunk_cxx { &t.cxx } else { &t.cc };
+            let node_depfile = if crate::compiler::is_msvc_compiler(compiler) { None } else { Some(depfile.clone()) };
             let cmd = unity_compile_command(
                 &CompileContext {
                     cc: compiler,
@@ -308,18 +371,28 @@ fn plan_object_nodes(
                 *skipped += 1;
             }
             let inputs = if cached { hit_inputs } else { chunk.to_vec() };
-            nodes.push(Node {
+            let custom_deps: Vec<NodeId> = {
+                let mut v: Vec<NodeId> = chunk
+                    .iter()
+                    .filter_map(|s| custom_by_out.get(s).copied())
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            nodes.push((Node {
                 id: 0,
                 key,
                 kind: TaskKind::Compile,
                 inputs,
-                depfile: Some(depfile),
+                depfile: node_depfile,
                 output: obj,
+                extra_outputs: vec![],
                 command: cmd,
                 parallel: t.parallel,
                 label: format!("CC {} [{}]", t.name, chunk.len()),
                 cached,
-            });
+            }, custom_deps));
         }
     } else {
         for (i, src) in t.sources.iter().enumerate() {
@@ -331,6 +404,7 @@ fn plan_object_nodes(
             let depfile = obj_dir.join(format!("{}_{}_{}.d", safe_name(&t.name), i, safe_name(stem)));
             let is_cxx_src = t.language == Language::Cpp || is_cxx(src);
             let compiler = if is_cxx_src { &t.cxx } else { &t.cc };
+            let node_depfile = if crate::compiler::is_msvc_compiler(compiler) { None } else { Some(depfile.clone()) };
             let cmd = compile_command(
                 &CompileContext {
                     cc: compiler,
@@ -350,18 +424,24 @@ fn plan_object_nodes(
                 *skipped += 1;
             }
             let inputs = if cached { hit_inputs } else { vec![src.clone()] };
-            nodes.push(Node {
+            let custom_deps: Vec<NodeId> = custom_by_out
+                .get(src)
+                .copied()
+                .into_iter()
+                .collect();
+            nodes.push((Node {
                 id: 0,
                 key,
                 kind: TaskKind::Compile,
                 inputs,
-                depfile: Some(depfile),
+                depfile: node_depfile,
                 output: obj,
+                extra_outputs: vec![],
                 command: cmd,
                 parallel: t.parallel,
                 label: format!("CC {} ({})", t.name, src.file_name().and_then(|s| s.to_str()).unwrap_or("")),
                 cached,
-            });
+            }, custom_deps));
         }
     }
     Ok(nodes)
@@ -418,6 +498,7 @@ fn make_simple_link(
         inputs: link_task.inputs.clone(),
         depfile: None,
         output: link_task.output.clone(),
+        extra_outputs: vec![],
         command: link_task.command.clone(),
         parallel: t.parallel,
         label: link_task.label.clone(),
@@ -468,6 +549,7 @@ fn noop_node(name: &str, kind: &str) -> Node {
         inputs: vec![],
         depfile: None,
         output: PathBuf::new(),
+        extra_outputs: vec![],
         command: vec![],
         parallel: false,
         label: format!("{kind} {name}"),
@@ -475,14 +557,9 @@ fn noop_node(name: &str, kind: &str) -> Node {
     }
 }
 
-/// 生成自定义命令节点（钩子）。
-fn make_command_node(
-    target: &str,
-    phase: &str,
-    cmd: &crate::script::Command,
-    host: &crate::platform::Host,
-) -> Node {
-    let command = match cmd {
+/// 把 `Command` 转成 argv（Shell → sh -c / cmd /C）。
+fn command_argv(cmd: &crate::script::Command, host: &crate::platform::Host) -> Vec<String> {
+    match cmd {
         crate::script::Command::Shell(s) => {
             if host.os.is_windows_family() {
                 vec!["cmd".to_string(), "/C".to_string(), s.clone()]
@@ -495,7 +572,17 @@ fn make_command_node(
             c.extend(args.iter().cloned());
             c
         }
-    };
+    }
+}
+
+/// 生成自定义命令节点（钩子）。
+fn make_command_node(
+    target: &str,
+    phase: &str,
+    cmd: &crate::script::Command,
+    host: &crate::platform::Host,
+) -> Node {
+    let command = command_argv(cmd, host);
     Node {
         id: 0,
         key: format!("hook:{target}:{phase}"),
@@ -503,6 +590,7 @@ fn make_command_node(
         inputs: vec![],
         depfile: None,
         output: PathBuf::new(),
+        extra_outputs: vec![],
         command,
         parallel: false,
         label: format!("HOOK {target} {phase}"),

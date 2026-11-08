@@ -123,12 +123,14 @@ pub fn execute(
             let ok = if node.cached {
                 true
             } else {
-                // 确保产物父目录存在。
-                if !node.output.as_os_str().is_empty() {
-                    if let Some(parent) = node.output.parent() {
-                        if !parent.exists() {
-                            if let Err(e) = std::fs::create_dir_all(parent) {
-                                eprintln!("  [ERROR] 创建目录 {} 失败: {e}", parent.display());
+                // 确保产物父目录存在（含自定义命令的额外产物）。
+                for out in std::iter::once(&node.output).chain(node.extra_outputs.iter()) {
+                    if !out.as_os_str().is_empty() {
+                        if let Some(parent) = out.parent() {
+                            if !parent.exists() {
+                                if let Err(e) = std::fs::create_dir_all(parent) {
+                                    eprintln!("  [ERROR] 创建目录 {} 失败: {e}", parent.display());
+                                }
                             }
                         }
                     }
@@ -190,7 +192,9 @@ pub fn execute(
                         if !node.cached {
                             if !node.output.as_os_str().is_empty() {
                                 let cmd_hash = hash_cmd(&node.command);
-                                let outs = vec![node.output.to_string_lossy().into_owned()];
+                                let mut outs: Vec<String> =
+                                    node.extra_outputs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                                outs.insert(0, node.output.to_string_lossy().into_owned());
                                 let rec_inputs = refresh_compile_inputs(node, &result.inputs);
                                 cache.record(node.key.clone(), &rec_inputs, cmd_hash, outs);
                                 // 产物变化 → 使所有依赖此产物的后继缓存失效。
@@ -228,7 +232,9 @@ pub fn execute(
             if actually_built {
                 if !node.output.as_os_str().is_empty() {
                     let cmd_hash = hash_cmd(&node.command);
-                    let outs = vec![node.output.to_string_lossy().into_owned()];
+                    let mut outs: Vec<String> =
+                        node.extra_outputs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    outs.insert(0, node.output.to_string_lossy().into_owned());
                     let rec_inputs = refresh_compile_inputs(node, &result.inputs);
                     cache.record(node.key.clone(), &rec_inputs, cmd_hash, outs);
                     // 输入变了 → 使所有依赖此产物的后继缓存失效。
@@ -333,6 +339,7 @@ mod tests {
             inputs: vec![],
             depfile: None,
             output: PathBuf::new(),
+            extra_outputs: vec![],
             command: cmd,
             parallel: true,
             label: key.into(),

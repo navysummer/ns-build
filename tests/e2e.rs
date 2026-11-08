@@ -53,6 +53,321 @@ fn init_scaffolds_builds_and_runs() {
 }
 
 #[test]
+fn custom_command_generates_source_and_rebuilds_on_change() {
+    let d = tmpdir("custom-gen");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "gendemo"
+
+[[custom_commands]]
+name = "version"
+outputs = ["build/gen/version.c"]
+command = { program = "sh", args = ["-c", "printf 'int version(void){return 42;}\n' > build/gen/version.c"] }
+depends = ["template.txt"]
+
+[[targets]]
+name = "gendemo"
+kind = "exe"
+sources = ["src/main.c", "build/gen/version.c"]
+"#,
+    );
+    write(&d.join("template.txt"), "v1\n");
+    write(
+        &d.join("src/main.c"),
+        r#"
+#include <stdio.h>
+int version(void);
+int main(void) { printf("%d\n", version()); return 0; }
+"#,
+    );
+
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "首次构建失败: {err}");
+    assert!(d.join("build/gen/version.c").exists(), "生成源未产生");
+    let out = Command::new(d.join("build/gendemo")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+
+    // 无变化：全部跳过。
+    let (out2, err2, code2) = run_ns_build(&["build"], &d);
+    assert_eq!(code2, 0, "二次构建失败: {err2}");
+    assert!(out2.contains("0 构建"), "增量应全部跳过: {out2} {err2}");
+
+    // 改 depends → 生成命令 + 生成源编译 + 链接重建（main.c 不动）。
+    write(&d.join("template.txt"), "v2\n");
+    let (out3, err3, code3) = run_ns_build(&["build", "--verbose"], &d);
+    assert_eq!(code3, 0, "depends 变更后构建失败: {err3}");
+    assert!(out3.contains("3 构建"), "应重建 gen+cc(version)+link: {out3} {err3}");
+    assert!(d.join("build/gen/version.c").exists());
+
+    // 删除生成产物 → 必须重新生成。
+    std::fs::remove_file(d.join("build/gen/version.c")).unwrap();
+    let (_out4, err4, code4) = run_ns_build(&["build"], &d);
+    assert_eq!(code4, 0, "产物缺失后构建失败: {err4}");
+    assert!(d.join("build/gen/version.c").exists(), "产物缺失未重新生成");
+}
+
+#[test]
+fn custom_command_chained_by_deps() {
+    let d = tmpdir("custom-chain");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "chaingen"
+
+[[custom_commands]]
+name = "stage1"
+outputs = ["build/gen/stage1.txt"]
+command = { program = "sh", args = ["-c", "printf 'stage1-content\n' > build/gen/stage1.txt"] }
+
+[[custom_commands]]
+name = "stage2"
+outputs = ["build/gen/version.c"]
+command = { program = "sh", args = ["-c", "printf 'int version(void){return 7;}\n' > build/gen/version.c"] }
+deps = ["stage1"]
+depends = ["build/gen/stage1.txt"]
+
+[[targets]]
+name = "chaingen"
+kind = "exe"
+sources = ["src/main.c", "build/gen/version.c"]
+"#,
+    );
+    write(
+        &d.join("src/main.c"),
+        r#"
+#include <stdio.h>
+int version(void);
+int main(void) { printf("%d\n", version()); return 0; }
+"#,
+    );
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "链式生成构建失败: {err}");
+    assert!(d.join("build/gen/stage1.txt").exists());
+    let out = Command::new(d.join("build/chaingen")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+#[test]
+fn preset_applies_compile_flags_and_fails_unknown() {
+    let d = tmpdir("preset");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "predemo"
+
+[presets]
+fast = { profile = "debug", defines = { DIST_VALUE = "11" }, unity = "off" }
+dist = { profile = "release", defines = { DIST_VALUE = "7" } }
+
+[[targets]]
+name = "predemo"
+kind = "exe"
+sources = ["src/main.c"]
+defines = ["FROM_PRESET=${DIST_VALUE}"]
+"#,
+    );
+    write(
+        &d.join("src/main.c"),
+        "#ifndef FROM_PRESET\n#error FROM_PRESET 未定义\n#endif\nint main(void){return FROM_PRESET;}\n",
+    );
+    // 预设变量替换进 -D 宏 → 编译通过，退出码 = 宏值。
+    let (_, err, code) = run_ns_build(&["build", "--preset", "fast"], &d);
+    assert_eq!(code, 0, "预设构建失败: {err}");
+    let out = Command::new(d.join("build/predemo")).output().unwrap();
+    assert_eq!(out.status.code(), Some(11), "预设 defines 未生效");
+
+    // 命令行 --define 覆盖预设同名变量。
+    let (_, err, code) = run_ns_build(&["build", "--preset", "fast", "--define", "DIST_VALUE=3"], &d);
+    assert_eq!(code, 0, "CLI define 覆盖失败: {err}");
+    let out = Command::new(d.join("build/predemo")).output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "CLI --define 应覆盖预设");
+
+    // 未知预设：报错并列出可选项。
+    let (_, err, code) = run_ns_build(&["build", "--preset", "nope"], &d);
+    assert_ne!(code, 0, "未知预设应失败");
+    assert!(err.contains("predemo") || err.contains("fast") || err.contains("dist"), "错误信息应列出可选预设: {err}");
+
+    // presets 列表命令能列出两个预设。
+    let (out, _, code) = run_ns_build(&["presets"], &d);
+    assert_eq!(code, 0);
+    assert!(out.contains("fast"), "presets 应列出 fast: {out}");
+    assert!(out.contains("dist"), "presets 应列出 dist: {out}");
+}
+
+#[test]
+fn export_and_import_package() {
+    let d = tmpdir("export-import");
+
+    // ---- 项目 A：mylib（静态库 + 头文件 + 导出）----
+    let a = d.join("mylib");
+    write(
+        &a.join("ns-build.toml"),
+        r#"
+[project]
+name = "mylib"
+version = "1.2.3"
+
+[[install_headers]]
+from = "include"
+to = "include"
+files = ["**/*.h"]
+
+[[targets]]
+name = "mylib"
+kind = "static"
+sources = ["src/lib.c"]
+defines = ["MYLIB_BONUS=100"]
+
+[[exports]]
+name = "mylib"
+"#,
+    );
+    write(&a.join("include/mylib.h"), "int mylib_value(void);\n");
+    write(&a.join("src/lib.c"), "int mylib_value(void){return 7;}\n");
+    let prefix = d.join("prefix");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix.to_str().unwrap()],
+        &a,
+    );
+    assert_eq!(code, 0, "install/export 失败: {err}");
+    assert!(prefix.join("lib/libmylib.a").exists(), "静态库未安装");
+    assert!(prefix.join("include/mylib.h").exists(), "头文件未安装");
+    let cfg_path = prefix.join("lib/cmake/mylib/mylib-config.toml");
+    assert!(cfg_path.exists(), "导出配置未生成: {}", cfg_path.display());
+    let cfg_text = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(cfg_text.contains("name = \"mylib\""), "配置缺包名: {cfg_text}");
+    assert!(cfg_text.contains("libmylib.a"), "配置缺产物: {cfg_text}");
+    assert!(cfg_text.contains("1.2.3"), "配置缺版本: {cfg_text}");
+
+    // ---- 项目 B：app（import 已安装的 mylib）----
+    let b = d.join("app");
+    write(
+        &b.join("ns-build.toml"),
+        &format!(
+            r#"
+[project]
+name = "app"
+
+[[imports]]
+from = "{}"
+name = "mylib"
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+            prefix.display()
+        ),
+    );
+    write(
+        &b.join("src/main.c"),
+        r#"
+#include <stdio.h>
+#include <mylib.h>
+#ifndef MYLIB_BONUS
+#error MYLIB_BONUS 未被导入
+#endif
+int main(void) { printf("%d\n", mylib_value() + MYLIB_BONUS); return 0; }
+"#,
+    );
+    let (_, err, code) = run_ns_build(&["build"], &b);
+    assert_eq!(code, 0, "import 构建失败: {err}");
+    let out = Command::new(b.join("build/app")).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "107\n",
+        "import 链接/运行失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn fetch_git_and_url_packages() {
+    let d = tmpdir("fetch");
+
+    // ---- 本地 "远程" git 仓库 ----
+    let remote = d.join("remote-git");
+    std::fs::create_dir_all(&remote).unwrap();
+    let git = |args: &[&str]| {
+        let st = Command::new("git").args(args).current_dir(&remote).status().unwrap();
+        assert!(st.success(), "git {:?} 失败", args);
+    };
+    git(&["init", "-b", "main"]);
+    write(&remote.join("include/hello.h"), "#define FETCH_MAGIC 99\n");
+    git(&["add", "."]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+
+    // ---- 本地压缩包 ----
+    let pkgdir = d.join("archive-src");
+    write(&pkgdir.join("top/pkg.txt"), "pkg-content\n");
+    let archive = d.join("pkg.tar.gz");
+    let st = Command::new("tar")
+        .args(["-czf", archive.to_str().unwrap(), "-C", pkgdir.to_str().unwrap(), "top"])
+        .status()
+        .unwrap();
+    assert!(st.success(), "tar 打包失败");
+
+    write(
+        &d.join("ns-build.toml"),
+        &format!(
+            r#"
+[project]
+name = "fetchtest"
+
+[[fetch]]
+name = "myrepo"
+git = "file://{}"
+
+[[fetch]]
+name = "mypkg"
+url = "file://{}"
+strip_components = 1
+"#,
+            remote.display(),
+            archive.display()
+        ),
+    );
+
+    let (_, err, code) = run_ns_build(&["fetch"], &d);
+    assert_eq!(code, 0, "fetch 失败: {err}");
+    assert_eq!(
+        std::fs::read_to_string(d.join(".ns-fetch/myrepo/include/hello.h")).unwrap(),
+        "#define FETCH_MAGIC 99\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.join(".ns-fetch/mypkg/pkg.txt")).unwrap(),
+        "pkg-content\n"
+    );
+    assert!(d.join(".ns-fetch/myrepo/.ns-fetch.toml").exists());
+    assert!(d.join(".ns-fetch/mypkg/.ns-fetch.toml").exists());
+
+    // 再次 fetch：已存在则跳过。
+    let (out, _, code) = run_ns_build(&["fetch"], &d);
+    assert_eq!(code, 0);
+    assert!(out.contains("跳过 myrepo"), "应跳过已存在的包: {out}");
+
+    // --update：重新拉取。
+    let (_out2, err2, code2) = run_ns_build(&["fetch", "--update"], &d);
+    assert_eq!(code2, 0, "--update 失败: {err2}");
+    assert!(d.join(".ns-fetch/myrepo/include/hello.h").exists());
+
+    // 非法 name：报错。
+    let d2 = tmpdir("fetch-bad");
+    write(
+        &d2.join("ns-build.toml"),
+        "[project]\nname = \"bad\"\n\n[[fetch]]\nname = \"a/b\"\ngit = \"file:///tmp/x\"\n",
+    );
+    let (_, err, code) = run_ns_build(&["fetch"], &d2);
+    assert_ne!(code, 0);
+    assert!(err.contains("非法"), "应报告非法 name: {err}");
+}
+
+#[test]
 fn builds_hello_c_and_runs() {
     let d = tmpdir("hello");
     write(

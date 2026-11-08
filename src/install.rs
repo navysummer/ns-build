@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::script::{ResolvedScript, TargetKind};
+use crate::export::{ExportConfig, ExportPackage, ExportedTarget};
+use crate::script::{ResolvedScript, ResolvedTarget, TargetKind};
 
 /// 安装结果。
 #[derive(Debug, Default, Clone)]
@@ -54,6 +55,8 @@ pub fn install_all(script: &ResolvedScript, prefix: &Path) -> Result<InstallRepo
             }
         }
     }
+    // 安装导出：写入 `<name>-config.toml`（CMake install(EXPORT) 等价）。
+    install_exports(script, prefix, &mut report)?;
     // 通用文件安装规则（`[[install_files]]`）。
     for f in &script.script.install_files {
         let to_base = prefix.join(&f.to);
@@ -80,6 +83,100 @@ pub fn install_all(script: &ResolvedScript, prefix: &Path) -> Result<InstallRepo
         }
     }
     Ok(report)
+}
+
+/// 写入安装导出的配置文件并汇报到用户可见输出。
+fn install_exports(
+    script: &ResolvedScript,
+    prefix: &Path,
+    report: &mut InstallReport,
+) -> Result<(), String> {
+    for exp in &script.script.exports {
+        if exp.name.trim().is_empty() {
+            return Err("exports：name 不能为空".into());
+        }
+        // 选择导出目标：显式列表（校验存在）；否则所有 install 的库类目标。
+        let selected: Vec<&ResolvedTarget> = if exp.targets.is_empty() {
+            script
+                .targets
+                .iter()
+                .filter(|t| {
+                    t.install
+                        && matches!(
+                            t.kind,
+                            TargetKind::Static | TargetKind::Lib | TargetKind::Module
+                        )
+                })
+                .collect()
+        } else {
+            let mut v = Vec::with_capacity(exp.targets.len());
+            for name in &exp.targets {
+                let t = script
+                    .targets
+                    .iter()
+                    .find(|t| &t.name == name)
+                    .ok_or_else(|| format!("导出包 '{}'：target '{name}' 不存在", exp.name))?;
+                if matches!(t.kind, TargetKind::Exe | TargetKind::Object) {
+                    return Err(format!(
+                        "导出包 '{}'：target '{name}' 是 {}，只能导出 lib/static/module",
+                        exp.name,
+                        match t.kind {
+                            TargetKind::Exe => "可执行文件",
+                            _ => "object 库",
+                        }
+                    ));
+                }
+                v.push(t);
+            }
+            v
+        };
+        let kind_name = |k: TargetKind| match k {
+            TargetKind::Static => "static",
+            TargetKind::Lib => "lib",
+            TargetKind::Module => "module",
+            TargetKind::Object => "object",
+            TargetKind::Exe => "exe",
+            TargetKind::Interface => "interface",
+            TargetKind::Phony => "phony",
+        };
+        let config = ExportConfig {
+            package: ExportPackage {
+                name: exp.name.clone(),
+                version: if exp.version.is_empty() {
+                    script.script.project.version.clone()
+                } else {
+                    exp.version.clone()
+                },
+            },
+            targets: selected
+                .iter()
+                .map(|t| ExportedTarget {
+                    name: t.name.clone(),
+                    kind: kind_name(t.kind).to_string(),
+                    output: file_name(&t.output),
+                    include_dirs: vec!["include".to_string()],
+                    defines: t.defines.clone(),
+                    link: t.link.clone(),
+                })
+                .collect(),
+        };
+        let to = if exp.to.is_empty() {
+            format!("lib/cmake/{}", exp.name)
+        } else {
+            exp.to.clone()
+        };
+        let to_dir = prefix.join(&to);
+        std::fs::create_dir_all(&to_dir)
+            .map_err(|e| format!("创建导出目录 {} 失败: {e}", to_dir.display()))?;
+        let path = to_dir.join(format!("{}-config.toml", exp.name));
+        let text = toml::to_string_pretty(&config)
+            .map_err(|e| format!("序列化导出配置 '{}' 失败: {e}", exp.name))?;
+        std::fs::write(&path, &text)
+            .map_err(|e| format!("写入导出配置 {} 失败: {e}", path.display()))?;
+        println!("[ns-build] 导出包 {} -> {}", exp.name, path.display());
+        report.installed += selected.len();
+    }
+    Ok(())
 }
 
 fn file_name(p: &Path) -> String {

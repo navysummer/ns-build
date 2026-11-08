@@ -48,6 +48,14 @@ pub fn is_shared_lib(path: &Path) -> bool {
         || name.contains(".so.")
 }
 
+/// 判断编译器/链接器/归档器是否 MSVC 风格工具链
+///（cl / clang-cl 编译器，link 链接器，lib 归档器；含 .exe 后缀、大小写、路径前缀）。
+pub fn is_msvc_compiler(cc: &str) -> bool {
+    let stem = cc.rsplit(['/', '\\']).next().unwrap_or(cc).to_lowercase();
+    let stem = stem.strip_suffix(".exe").unwrap_or(&stem);
+    matches!(stem, "cl" | "clang-cl" | "link" | "lib")
+}
+
 /// 判断文件是否 C++ 源。
 pub fn is_cxx(path: &Path) -> bool {
     matches!(
@@ -127,6 +135,9 @@ pub fn compile_command(
     out: &Path,
     depfile: &Path,
 ) -> Vec<String> {
+    if is_msvc_compiler(ctx.cc) {
+        return compile_command_msvc(ctx, src, out);
+    }
     let mut cmd = vec![ctx.cc.to_string()];
     ctx.push_common_flags(&mut cmd);
     cmd.push(depfile.to_string_lossy().into_owned());
@@ -138,6 +149,62 @@ pub fn compile_command(
     cmd
 }
 
+/// MSVC（cl / clang-cl）编译命令：/c /O2 等。不产出 depfile——
+/// MSVC 没有 `-MMD` 等价物（`/sourceDependencies` 是 JSON 格式），
+/// MSVC 风格下增量检测仅基于源文件与命令指纹。
+fn compile_command_msvc(ctx: &CompileContext<'_>, src: &Path, out: &Path) -> Vec<String> {
+    let t = ctx.target;
+    let mut cmd = vec![ctx.cc.to_string(), "/nologo".into(), "/c".into()];
+    for f in ctx.profile.msvc_opt_flags() {
+        cmd.push(f.to_string());
+    }
+    // 编译标准。
+    if ctx.is_cxx {
+        let std = t.cxx_std.as_deref().unwrap_or("c++17");
+        let mapped = match std {
+            "c++14" | "gnu++14" => "/std:c++14".to_string(),
+            "c++17" | "gnu++17" => "/std:c++17".to_string(),
+            "c++20" | "gnu++20" => "/std:c++20".to_string(),
+            "c++23" | "gnu++23" => "/std:c++latest".to_string(),
+            _ => "/std:c++17".to_string(),
+        };
+        cmd.push(mapped);
+    } else {
+        let std = t.c_std.as_deref().unwrap_or("c11");
+        let mapped = match std {
+            "c11" => "/std:c11",
+            "c17" | "c23" | "gnu11" | "gnu17" | "gnu23" => "/std:clatest",
+            _ => "/std:c11",
+        };
+        cmd.push(mapped.to_string());
+    }
+    // 警告。
+    cmd.push(if t.warnings { "/W3".into() } else { "/w".into() });
+    // 宏定义。
+    for d in &t.defines {
+        cmd.push(format!("/D{d}"));
+    }
+    // include 目录。
+    for inc in &t.include_dirs {
+        cmd.push(format!("/I{}", inc.display()));
+    }
+    // 预编译头（/FI：强制包含，与 -include 等价语义）。
+    if let Some(pch) = &t.pch {
+        cmd.push(format!("/FI{pch}"));
+    }
+    // 编译标志（原样透传）。
+    for f in &t.flags {
+        cmd.push(f.clone());
+    }
+    let lang_flags = if ctx.is_cxx { &t.cxxflags } else { &t.cflags };
+    for f in lang_flags {
+        cmd.push(f.clone());
+    }
+    cmd.push(format!("/Fo{}", out.display()));
+    cmd.push(src.to_string_lossy().into_owned());
+    cmd
+}
+
 /// unity build：将多个源文件合成一个合并单元（`#include` 全部源），
 /// 编译为单个 `.o`，大幅减少编译启动开销。
 pub fn unity_compile_command(
@@ -146,6 +213,9 @@ pub fn unity_compile_command(
     out: &Path,
     depfile: &Path,
 ) -> Vec<String> {
+    if is_msvc_compiler(ctx.cc) {
+        return compile_command_msvc(ctx, unity_src, out);
+    }
     let mut cmd = vec![ctx.cc.to_string()];
     ctx.push_common_flags(&mut cmd);
     cmd.push(depfile.to_string_lossy().into_owned());
@@ -177,6 +247,9 @@ pub fn link_command(
 ) -> Vec<String> {
     let is_cpp = matches!(target.language, crate::script::Language::Cpp);
     let linker = if is_cpp { target.cxx.clone() } else { target.cc.clone() };
+    if is_msvc_compiler(&linker) {
+        return link_command_msvc(target, objs, out, profile);
+    }
     let mut cmd = vec![linker];
 
     for f in profile.opt_flags() {
@@ -258,8 +331,67 @@ pub fn link_command(
     cmd
 }
 
-/// 归档命令（静态库）。
-pub fn archive_command(ar: &str, objs: &[PathBuf], out: &Path) -> Vec<String> {
+/// MSVC 库名映射：裸名 `foo` → `foo.lib`；带路径或已带库后缀的原样保留。
+pub fn msvc_lib_name(lib: &str) -> String {
+    if lib.contains('/')
+        || lib.contains('\\')
+        || lib.starts_with('-')
+        || [".lib", ".obj", ".a", ".dll", ".dylib", ".so"]
+            .iter()
+            .any(|s| lib.to_lowercase().ends_with(s))
+    {
+        return lib.to_string();
+    }
+    format!("{lib}.lib")
+}
+
+/// MSVC 链接命令（link.exe / lld-link）：/nologo /OUT: /DLL /DEBUG 等。
+/// 注意：MSVC 无 rpath（运行时 DLL 依赖通过 PATH/SxS 解决）。
+fn link_command_msvc(
+    target: &ResolvedTarget,
+    objs: &[PathBuf],
+    out: &Path,
+    profile: Profile,
+) -> Vec<String> {
+    let mut cmd = vec!["link".to_string(), "/nologo".into()];
+    for o in objs {
+        cmd.push(o.to_string_lossy().into_owned());
+    }
+    match target.kind {
+        crate::script::TargetKind::Lib | crate::script::TargetKind::Module => {
+            cmd.push("/DLL".into());
+        }
+        _ => {}
+    }
+    // 调试配置 → /DEBUG（生成 .pdb）。
+    if matches!(profile, Profile::Debug | Profile::RelWithDebInfo) {
+        cmd.push("/DEBUG".into());
+    }
+    for d in &target.link_dirs {
+        cmd.push(format!("/LIBPATH:{}", d.display()));
+    }
+    for l in &target.link {
+        cmd.push(msvc_lib_name(l));
+    }
+    // link_flags 原样透传。
+    for f in &target.link_flags {
+        cmd.push(f.clone());
+    }
+    // pkg-config 是 POSIX 工具，MSVC 风格下忽略。
+    cmd.push(format!("/OUT:{}", out.display()));
+    cmd
+}
+
+/// 归档命令（静态库）：MSVC 下用 lib.exe，链接器/归档器名 `lib` 或工具链声明为 MSVC 时启用。
+pub fn archive_command(ar: &str, objs: &[PathBuf], out: &Path, msvc: bool) -> Vec<String> {
+    if msvc || is_msvc_compiler(ar) {
+        let mut cmd = vec![ar.to_string(), "/nologo".into()];
+        cmd.push(format!("/OUT:{}", out.display()));
+        for o in objs {
+            cmd.push(o.to_string_lossy().into_owned());
+        }
+        return cmd;
+    }
     let mut cmd = vec![ar.to_string()];
     cmd.push("rcs".into());
     cmd.push(out.to_string_lossy().into_owned());
@@ -288,7 +420,11 @@ pub fn make_link_task(
         Language::Shell => script_package_command(target, &inputs, host),
         // C / C++：原有编译链接。
         _ => match target.kind {
-            TargetKind::Static => archive_command(ar, &inputs, &target.output),
+            TargetKind::Static => {
+                let is_cpp_target = matches!(target.language, crate::script::Language::Cpp);
+                let probe = if is_cpp_target { &target.cxx } else { &target.cc };
+                archive_command(ar, &inputs, &target.output, is_msvc_compiler(probe))
+            }
             _ => link_command(target, &inputs, &target.output, host, profile),
         },
     };
@@ -497,7 +633,7 @@ mod tests {
     #[test]
     fn archive_uses_rcs() {
         let t = target("a", TargetKind::Static);
-        let cmd = archive_command("ar", &[PathBuf::from("a.o")], &t.output);
+        let cmd = archive_command("ar", &[PathBuf::from("a.o")], &t.output, false);
         assert_eq!(cmd[0], "ar");
         assert_eq!(cmd[1], "rcs");
     }
@@ -564,5 +700,116 @@ mod tests {
             Path::new("a.d"),
         );
         assert!(!cmd.contains(&"-Wall".to_string()));
+    }
+
+    #[test]
+    fn msvc_detection() {
+        for cc in ["cl", "cl.exe", "CL", "clang-cl", "clang-cl.exe", "/opt/x/clang-cl", "lib", "link"] {
+            assert!(is_msvc_compiler(cc), "{cc} 应识别为 MSVC 风格");
+        }
+        for cc in ["cc", "gcc", "clang", "c++", "ar"] {
+            assert!(!is_msvc_compiler(cc), "{cc} 不应识别为 MSVC 风格");
+        }
+    }
+
+    #[test]
+    fn msvc_compile_command_shape() {
+        let mut t = target("a", TargetKind::Exe);
+        t.defines = vec!["FOO=1".into(), "BAR".into()];
+        t.include_dirs = vec![PathBuf::from("/inc")];
+        t.pch = Some("pch.h".into());
+        let cmd = compile_command(
+            &CompileContext {
+                cc: "cl",
+                target: &t,
+                profile: Profile::Release,
+                is_cxx: false,
+            },
+            Path::new("a.c"),
+            Path::new("build/a.obj"),
+            Path::new("unused.d"),
+        );
+        assert_eq!(cmd[0], "cl");
+        assert!(cmd.contains(&"/nologo".to_string()));
+        assert!(cmd.contains(&"/c".to_string()));
+        assert!(cmd.contains(&"/O2".to_string()));
+        assert!(cmd.contains(&"/std:c11".to_string()));
+        assert!(cmd.contains(&"/W3".to_string()));
+        assert!(cmd.contains(&"/DFOO=1".to_string()));
+        assert!(cmd.contains(&"/DBAR".to_string()));
+        assert!(cmd.contains(&"/I/inc".to_string()));
+        assert!(cmd.contains(&"/FIpch.h".to_string()));
+        assert!(cmd.contains(&"/Fobuild/a.obj".to_string()));
+        // MSVC 没有 -MMD/-c/-o/-fPIC 这些 GNU 风格参数。
+        assert!(!cmd.iter().any(|c| c == "-c" || c == "-MMD" || c == "-fPIC" || c == "-o"));
+        // 警告关闭 → /w
+        t.warnings = false;
+        let cmd2 = compile_command(
+            &CompileContext {
+                cc: "cl",
+                target: &t,
+                profile: Profile::Debug,
+                is_cxx: true,
+            },
+            Path::new("a.cpp"),
+            Path::new("a.obj"),
+            Path::new("unused.d"),
+        );
+        assert!(cmd2.contains(&"/w".to_string()));
+        assert!(cmd2.contains(&"/Od".to_string()));
+        assert!(cmd2.contains(&"/Zi".to_string()));
+        assert!(cmd2.contains(&"/std:c++17".to_string()));
+    }
+
+    #[test]
+    fn msvc_link_command_shape() {
+        let mut t = target("a", TargetKind::Exe);
+        t.cc = "cl".into();
+        t.cxx = "cl".into();
+        t.link = vec!["m".into(), "shell32".into(), "/opt/lib/foo.lib".into()];
+        t.link_dirs = vec![PathBuf::from("/opt/lib")];
+        let cmd = link_command(
+            &t,
+            &[PathBuf::from("a.obj")],
+            &PathBuf::from("app.exe"),
+            Host::current(),
+            Profile::Debug,
+        );
+        assert_eq!(cmd[0], "link");
+        assert!(cmd.contains(&"/nologo".to_string()));
+        assert!(cmd.contains(&"/DEBUG".to_string()));
+        assert!(cmd.contains(&"/LIBPATH:/opt/lib".to_string()));
+        assert!(cmd.contains(&"m.lib".to_string()));
+        assert!(cmd.contains(&"shell32.lib".to_string()));
+        assert!(cmd.contains(&"/opt/lib/foo.lib".to_string()));
+        assert!(cmd.contains(&"/OUT:app.exe".to_string()));
+        // 动态库 → /DLL
+        t.kind = TargetKind::Lib;
+        let dll = link_command(
+            &t,
+            &[PathBuf::from("a.obj")],
+            &PathBuf::from("a.dll"),
+            Host::current(),
+            Profile::Release,
+        );
+        assert!(dll.contains(&"/DLL".to_string()));
+    }
+
+    #[test]
+    fn msvc_archive_command_shape() {
+        let cmd = archive_command("lib", &[PathBuf::from("a.obj")], Path::new("foo.lib"), true);
+        assert_eq!(cmd[0], "lib");
+        assert!(cmd.contains(&"/nologo".to_string()));
+        assert!(cmd.contains(&"/OUT:foo.lib".to_string()));
+        assert!(cmd.contains(&"a.obj".to_string()));
+    }
+
+    #[test]
+    fn msvc_lib_name_mapping() {
+        assert_eq!(msvc_lib_name("m"), "m.lib");
+        assert_eq!(msvc_lib_name("shell32"), "shell32.lib");
+        assert_eq!(msvc_lib_name("C:/sdk/foo.lib"), "C:/sdk/foo.lib");
+        assert_eq!(msvc_lib_name("/abs/bar.a"), "/abs/bar.a");
+        assert_eq!(msvc_lib_name("./rel.obj"), "./rel.obj");
     }
 }

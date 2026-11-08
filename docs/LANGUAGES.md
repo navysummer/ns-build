@@ -202,3 +202,5 @@ sources = ["src/main.c"]
 ```
 
 不指定 `toolchain` 时按 `os`/`arch` 自动匹配（第一个都匹配的工具链生效）。全局默认可用 `[defaults] toolchain = "mingw"`。
+
+`cc` 为 `cl` / `clang-cl`（或 `ar = "lib"` / `link`）时自动使用 MSVC 风格命令行生成（`/nologo /Fo /OUT:` 等），裸库名映射为 `foo.lib`。注意：MSVC 风格不生成依赖文件（改头文件不触发重编），`pkg_config` 被忽略，且未在真实 MSVC SDK 上本机验证。

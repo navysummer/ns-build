@@ -119,6 +119,11 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 | 产物类型 | `exe` / `lib` / `module` / `static` / `object` / `interface` / `phony` |
 | 钩子 | `hooks.before`/`hooks.after` 构建前后自定义命令 |
 | 目标过滤 | `ns-build build <target>` 只构建指定目标（含传递依赖） |
+| 生成代码管线 | `[[custom_commands]]`（产物 + 依赖 + 增量，等价 `add_custom_command(OUTPUT)`） |
+| 安装导出 | `[[exports]]` 写入 `<name>-config.toml`；`[[imports]]` 读回并链接（`install(EXPORT)` / `find_package` 等价） |
+| 构建预设 | `[presets]` + `--preset` / `ns-build presets`（对应 `cmake --preset`） |
+| 外部依赖 | `[[fetch]]` + `ns-build fetch`（git / url，`FetchContent` 等价，支持 file:// 离线） |
+| MSVC 工具链 | `cl` / `clang-cl` 命令生成（未在真实 MSVC SDK 本机验证） |
 
 ## 与 CMake 对比
 
@@ -137,7 +142,10 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 | `target_compile_features` | `c_std` / `cxx_std` | ✅ |
 | `target_precompile_headers` | `pch`（`-include`） | ✅ |
 | `add_dependencies` | `deps`（顺序依赖） | ✅ |
-| `add_custom_command` | `hooks.before`/`hooks.after`（构建前后命令，不追踪自定义产物） | ➖ 部分 |
+| `add_custom_command` | `[[custom_commands]]`（产物追踪 + 增量 + 链式构建） | ✅ |
+| `install(EXPORT)` / `find_package` | `[[exports]]` / `[[imports]]`（TOML 配置） | ✅ |
+| `cmake --preset` | `[presets]` + `--preset` | ✅ |
+| `FetchContent` / `ExternalProject` | `[[fetch]]`（git/url，按需拉取） | ✅ |
 | 构建配置 | `--release`/`--debug`/`--profile`（Release/Debug/RelWithDebInfo/MinSizeRel） | ✅ |
 | `option()` / 缓存变量 | `[defaults].variables` + `--define name=value` | ✅ |
 | `install(TARGETS)` | `install = true` | ✅ |
@@ -155,8 +163,8 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 | `target_link_options` | `link_flags` | ✅ |
 | 多配置生成器 | 单配置（`--profile` 选择） | ➖ 声明式简化 |
 | 生成器表达式 `$<...>` | `${var}` 变量 + `when` 条件 | ➖ 声明式覆盖 |
-| `ExternalProject`/`FetchContent` | 外部工具链 + `hooks` | ➖ 规划中 |
-| 预设（presets） | 脚本即预设（声明式） | ➖ 设计取舍 |
+| 预设（presets） | `[presets]` + `--preset` | ✅ |
+| MSVC（cl/clang-cl） | 目标/工具链 cc=cl | ➖ 命令生成已测，未本机编译验证 |
 
 > **设计取舍**：CMake 是命令式语言（if/循环/函数）；ns-build 刻意保持**声明式** TOML，用 `when` 条件 + `include` 子脚本 + 变量替换覆盖常见动态需求，换来更简单、更现代的脚本。
 
@@ -177,16 +185,17 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 
 ## 已知边界
 
-- 无 MSVC 支持（命令行假定 GCC/Clang/MinGW 风格）。
-- 钩子只在构建前后执行，不追踪自定义产物；无 `add_custom_command(OUTPUT)` 式生成步骤。
+- MSVC：命令生成（cl/clang-cl）已单元测试覆盖，但未在真实 MSVC SDK 上本机验证；MSVC 风格不生成依赖文件（改头文件不触发重编）。
+- `pkg-config` 是 POSIX 工具，MSVC 风格下被忽略。
+- `zip` 压缩包不支持 `strip_components`（仅 tar）。
 - 单配置构建（用 `--profile` 切换）。
 - `pkg-config` 查询失败时按无该依赖处理（不展开 `-I`/`-l`），不会报错中断。
 
 ## 开发
 
 ```bash
-cargo test --lib          # 单元测试（43 个：解析/depfile/缓存/图/调度/编译器）
-cargo test --test e2e     # 端到端（真实 C 项目：构建/运行/增量/分步/unity/静态/动态库/安装）
+cargo test --lib          # 单元测试（53 个：解析/depfile/缓存/图/调度/编译器/导出配置）
+cargo test --test e2e     # 端到端（20 个：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置/init/生成代码/预设/导出导入/fetch）
 cargo test --test languages  # 多语言（C++ unity 推断等）
 cargo test --test perf    # 性能（300 文件全量 vs 增量）
 ./scripts/bench.sh        # 与 CMake+Ninja 对比基准
