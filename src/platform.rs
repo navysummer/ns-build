@@ -40,9 +40,12 @@ impl Os {
         }
     }
 
-    /// 是否 Windows 家族。
+    /// 是否 Windows。
+    ///
+    /// 只有 Windows 才用 `cmd /C`、`.exe` 后缀、无 rpath 等规则；
+    /// Android/iOS 是 Unix-like（.so/.dylib、`@rpath`、Unix 链接器旗标）。
     pub fn is_windows_family(&self) -> bool {
-        matches!(self, Self::Windows | Self::Android | Self::Ios)
+        matches!(self, Self::Windows)
     }
 
     /// 动态库文件名，如 `libfoo.dylib` / `libfoo.so` / `foo.dll`。
@@ -206,6 +209,12 @@ mod tests {
         assert_eq!(Os::Linux.static_name("foo"), "libfoo.a");
         assert_eq!(Os::Macos.exe_suffix(), "");
         assert_eq!(Os::Windows.exe_suffix(), ".exe");
+        // Android/iOS 是 Unix-like：无 .exe 后缀、走 Unix 链接器规则。
+        assert_eq!(Os::Android.exe_suffix(), "");
+        assert_eq!(Os::Ios.exe_suffix(), "");
+        assert!(!Os::Ios.is_windows_family());
+        assert!(!Os::Android.is_windows_family());
+        assert!(Os::Windows.is_windows_family());
     }
 
     #[test]

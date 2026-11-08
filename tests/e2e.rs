@@ -540,6 +540,8 @@ fn package_creates_archive_with_pc_export() {
 [project]
 name = "mypkg"
 version = "2.3.4"
+description = "my package desc"
+license = "MIT"
 
 [[install_headers]]
 from = "include"
@@ -571,6 +573,7 @@ pc = true
         .expect("mypkg.pc 未生成");
     assert!(pc_text.contains("prefix=${pcfiledir}/../.."), "pc prefix 应 relocatable: {pc_text}");
     assert!(pc_text.contains("Name: mypkg"), "pc 缺 Name: {pc_text}");
+    assert!(pc_text.contains("Description: my package desc"), "pc 缺 Description: {pc_text}");
     assert!(pc_text.contains("Version: 2.3.4"), "pc 缺版本: {pc_text}");
     assert!(pc_text.contains("-lmypkg"), "pc 缺 -lmypkg: {pc_text}");
     assert!(pc_text.contains("-lm"), "pc 缺 Libs.private: {pc_text}");
@@ -595,6 +598,1139 @@ pc = true
     ] {
         assert!(listing.contains(needle), "打包缺少 {needle}: {listing}");
     }
+}
+
+#[test]
+fn alias_target_redirects_build_and_link() {
+    let d = tmpdir("alias");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "aliasdemo"
+
+[[targets]]
+name = "core"
+kind = "static"
+sources = ["src/core.c"]
+
+[[targets]]
+name = "corealias"
+kind = "alias"
+alias = "core"
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+deps = ["corealias"]
+"#,
+    );
+    write(&d.join("src/core.c"), "int core_answer(void){return 41;}\n");
+    write(
+        &d.join("src/main.c"),
+        "#include <stdio.h>\nint core_answer(void);\nint main(void){printf(\"%d\\n\", core_answer()+1);return 0;}\n",
+    );
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "alias 构建失败: {err}");
+    assert!(
+        d.join("build/libcore.a").exists(),
+        "底层 core 未构建: {}",
+        err
+    );
+    assert!(
+        !d.join("build/corealias").exists(),
+        "alias 不应产生同名产物"
+    );
+    let out = Command::new(d.join("build/app")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+
+    // alias 指向不存在的目标 → 报错。
+    let d2 = tmpdir("alias-bad");
+    write(
+        &d2.join("ns-build.toml"),
+        "[project]\nname = \"bad\"\n\n[[targets]]\nname = \"badalias\"\nkind = \"alias\"\nalias = \"nonexistent\"\n",
+    );
+    let (_, err, code) = run_ns_build(&["build"], &d2);
+    assert_ne!(code, 0);
+    assert!(err.contains("不存在"), "错误信息应含'不存在': {err}");
+
+    // alias 环 → 报错。
+    let d3 = tmpdir("alias-cycle");
+    write(
+        &d3.join("ns-build.toml"),
+        r#"
+[project]
+name = "cyc"
+
+[[targets]]
+name = "a"
+kind = "alias"
+alias = "b"
+
+[[targets]]
+name = "b"
+kind = "alias"
+alias = "a"
+"#,
+    );
+    let (_, err, code) = run_ns_build(&["build"], &d3);
+    assert_ne!(code, 0);
+    assert!(err.contains("环"), "错误信息应含'环': {err}");
+}
+
+#[test]
+fn doctor_lists_tools() {
+    let d = tmpdir("doctor");
+    let (out, _, code) = run_ns_build(&["doctor"], &d);
+    assert_eq!(code, 0);
+    assert!(out.contains("cc"), "doctor 应列出 cc: {out}");
+    assert!(out.contains("git"), "doctor 应列出 git: {out}");
+    assert!(out.contains("[ok]") || out.contains("[missing]"), "doctor 应给出状态: {out}");
+}
+
+#[test]
+fn test_parallel_runs_concurrently() {
+    let d = tmpdir("test-parallel");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "paralleldemo"
+
+[[targets]]
+name = "t1"
+kind = "exe"
+sources = ["t1.c"]
+
+[[targets]]
+name = "t2"
+kind = "exe"
+sources = ["t2.c"]
+
+[[tests]]
+name = "sleepy-one"
+target = "t1"
+
+[[tests]]
+name = "sleepy-two"
+target = "t2"
+"#,
+    );
+    // 两个各睡 2 秒的程序：串行约 4s，并行约 2s + 进程启动开销。
+    write(&d.join("t1.c"), "#include <unistd.h>\nint main(void){sleep(2);return 0;}\n");
+    write(&d.join("t2.c"), "#include <unistd.h>\nint main(void){sleep(2);return 0;}\n");
+    // 串行运行（构建已缓存）作为基线，并行应显著快于它。
+    let t0 = std::time::Instant::now();
+    let (_, err, code) = run_ns_build(&["test", "--parallel", "1"], &d);
+    let serial = t0.elapsed().as_secs_f64();
+    assert_eq!(code, 0, "串行测试失败: {err}");
+
+    let t0 = std::time::Instant::now();
+    let (out, err, code) = run_ns_build(&["test", "--parallel", "2"], &d);
+    let parallel = t0.elapsed().as_secs_f64();
+    assert_eq!(code, 0, "并行测试失败: {err}");
+    assert!(out.contains("[PASS] sleepy-one"), "缺少测试输出: {out}");
+    assert!(out.contains("[PASS] sleepy-two"), "缺少测试输出: {out}");
+    assert!(
+        parallel < serial,
+        "并行 ({parallel:.2}s) 应快于串行 ({serial:.2}s): {out}"
+    );
+}
+
+#[test]
+fn includes_diamond_dedupes_and_cycle_terminates() {
+    // diamond: top includes left+right；both include base → base 只合并一次。
+    let d = tmpdir("diamond");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+includes = ["left", "right"]
+
+[project]
+name = "diamondapp"
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+deps = ["leftlib", "rightlib"]
+"#,
+    );
+    write(
+        &d.join("base/ns-build.toml"),
+        r#"
+[[targets]]
+name = "baselib"
+kind = "static"
+sources = ["src/basea.c"]
+"#,
+    );
+    write(&d.join("base/src/basea.c"), "int basea(void){return 5;}\n");
+    write(
+        &d.join("left/ns-build.toml"),
+        r#"
+includes = ["../base"]
+[[targets]]
+name = "leftlib"
+kind = "static"
+sources = ["src/left.c"]
+deps = ["baselib"]
+"#,
+    );
+    write(&d.join("left/src/left.c"), "int basea(void);\nint leftf(void){return basea();}\n");
+    write(
+        &d.join("right/ns-build.toml"),
+        r#"
+includes = ["../base"]
+[[targets]]
+name = "rightlib"
+kind = "static"
+sources = ["src/right.c"]
+deps = ["baselib"]
+"#,
+    );
+    write(&d.join("right/src/right.c"), "int basea(void);\nint rightf(void){return basea() + 1;}\n");
+    write(
+        &d.join("src/main.c"),
+        "#include <stdio.h>\nint leftf(void); int rightf(void);\nint main(void){printf(\"%d\\n\", leftf() + rightf());return 0;}\n",
+    );
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "diamond include 构建失败: {err}");
+    let out = Command::new(d.join("build/app")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "11\n");
+
+    // 环: a includes b, b includes a → 静默去重（CMake include_guard 语义），不死循环。
+    let d2 = tmpdir("include-cycle");
+    write(
+        &d2.join("ns-build.toml"),
+        r#"
+includes = ["sub"]
+
+[project]
+name = "cycleapp"
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["main.c"]
+"#,
+    );
+    write(
+        &d2.join("sub/ns-build.toml"),
+        r#"
+includes = [".."]
+[[targets]]
+name = "sublib"
+kind = "static"
+sources = ["sub.c"]
+"#,
+    );
+    write(&d2.join("sub/sub.c"), "int subf(void){return 1;}\n");
+    write(&d2.join("main.c"), "int main(void){return 0;}\n");
+    let (_, err, code) = run_ns_build(&["build"], &d2);
+    assert_eq!(code, 0, "include 环应静默去重: {err}");
+}
+
+#[test]
+fn show_json_is_machine_readable() {
+    let d = tmpdir("show-json");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "jsondemo"
+version = "3.2.1"
+
+[[targets]]
+name = "mylib"
+kind = "static"
+sources = ["src/lib.c"]
+private_deps = []
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+deps = ["mylib"]
+"#,
+    );
+    write(&d.join("src/lib.c"), "int f(void){return 1;}\n");
+    write(&d.join("src/main.c"), "int main(void){return 0;}\n");
+    let (out, _, code) = run_ns_build(&["show", "--json"], &d);
+    assert_eq!(code, 0);
+    let v: serde_json::Value =
+        serde_json::from_str(&out).expect("show --json 必须输出合法 JSON");
+    assert_eq!(v["project"]["name"], "jsondemo");
+    let targets = v["targets"].as_array().expect("targets 必须是数组");
+    let names: Vec<&str> = targets
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(names.contains(&"mylib"), "缺少 mylib: {names:?}");
+    assert!(names.contains(&"app"), "缺少 app: {names:?}");
+    let app = targets.iter().find(|t| t["name"] == "app").unwrap();
+    assert_eq!(app["kind"], "exe");
+    assert_eq!(app["deps"][0], "mylib");
+}
+
+#[test]
+fn install_strip_shrinks_binaries_and_keeps_them_working() {
+    let d = tmpdir("strip");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "stripdemo"
+
+[[targets]]
+name = "stripdemo"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+    );
+    write(
+        &d.join("src/main.c"),
+        "#include <stdio.h>\nint main(void){printf(\"strip-ok\\n\");return 0;}\n",
+    );
+    // 不 strip
+    let prefix1 = d.join("prefix1");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix1.to_str().unwrap()],
+        &d,
+    );
+    assert_eq!(code, 0, "install 失败: {err}");
+    // strip
+    let prefix2 = d.join("prefix2");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix2.to_str().unwrap(), "--strip"],
+        &d,
+    );
+    assert_eq!(code, 0, "install --strip 失败: {err}");
+    let plain = prefix1.join("bin/stripdemo");
+    let stripped = prefix2.join("bin/stripdemo");
+    assert!(plain.exists() && stripped.exists());
+    let nm = |p: &std::path::Path| {
+        Command::new("nm")
+            .arg(p)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+            .unwrap_or(0)
+    };
+    assert!(
+        nm(&stripped) < nm(&plain),
+        "strip 后符号数应更少 (stripped={} vs plain={})",
+        nm(&stripped),
+        nm(&plain)
+    );
+    // 仍能运行。
+    let out = Command::new(&stripped).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "strip-ok\n");
+}
+
+#[test]
+fn defaults_link_dirs_are_used() {
+    let d = tmpdir("link-dirs");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "linkdirdemo"
+
+[defaults]
+link_dirs = ["libs"]
+
+[[targets]]
+name = "linkdirdemo"
+kind = "exe"
+sources = ["src/main.c"]
+link = ["demoimpl"]
+"#,
+    );
+    write(&d.join("libs/libdemoimpl.a"), "!<arch>\n");
+    write(
+        &d.join("src/main.c"),
+        "int demoimpl(void);\nint main(void){return 0;}\n",
+    );
+    // 库有但符号不全，需要链接器报错而不是 "library not found"。
+    let (_, err, _code) = run_ns_build(&["build", "--verbose"], &d);
+    assert!(
+        err.contains("-L") && err.contains("libs"),
+        "link_dirs 应展开为 -L: {err}"
+    );
+}
+
+#[test]
+fn uninstall_removes_installed_files() {
+    let d = tmpdir("uninstall");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "unidemo"
+version = "1.0.0"
+
+[[install_headers]]
+from = "include"
+to = "include"
+files = ["**/*.h"]
+
+[[targets]]
+name = "unidemo"
+kind = "static"
+sources = ["src/lib.c"]
+
+[[exports]]
+name = "unidemo"
+pc = true
+"#,
+    );
+    write(&d.join("include/unidemo.h"), "int uni(void);\n");
+    write(&d.join("src/lib.c"), "int uni(void){return 1;}\n");
+    let prefix = d.join("prefix");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix.to_str().unwrap()],
+        &d,
+    );
+    assert_eq!(code, 0, "install 失败: {err}");
+    // 关键产物都在。
+    for rel in [
+        "lib/libunidemo.a",
+        "include/unidemo.h",
+        "lib/cmake/unidemo/unidemo-config.toml",
+        "lib/pkgconfig/unidemo.pc",
+        "share/ns-build/unidemo.manifest",
+    ] {
+        assert!(prefix.join(rel).exists(), "安装缺少 {rel}");
+    }
+    let (out, err, code) = run_ns_build(
+        &["uninstall", "--prefix", prefix.to_str().unwrap()],
+        &d,
+    );
+    assert_eq!(code, 0, "uninstall 失败: {err}");
+    assert!(out.contains("卸载"), "输出应包含卸载汇总: {out}");
+    for rel in [
+        "lib/libunidemo.a",
+        "include/unidemo.h",
+        "lib/cmake/unidemo/unidemo-config.toml",
+        "lib/pkgconfig/unidemo.pc",
+        "share/ns-build/unidemo.manifest",
+    ] {
+        assert!(!prefix.join(rel).exists(), "卸载后仍存在: {rel}");
+    }
+    // 再次卸载：清单已不存在 → 报错。
+    let (_, err, code) = run_ns_build(
+        &["uninstall", "--prefix", prefix.to_str().unwrap()],
+        &d,
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("清单"), "错误信息应提及清单: {err}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn origin_rpath_translated_to_loader_path() {
+    let d = tmpdir("rpath-macos");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "rpathdemo"
+
+[[targets]]
+name = "rpathdemo"
+kind = "exe"
+sources = ["src/main.c"]
+rpath = ["$ORIGIN/../lib"]
+"#,
+    );
+    write(&d.join("src/main.c"), "int main(void){return 0;}\n");
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "构建失败: {err}");
+    let exe = d.join("build/rpathdemo");
+    let out = Command::new("otool").args(["-l"]).arg(&exe).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("@loader_path/../lib"),
+        "macOS 上 $ORIGIN 应翻译为 @loader_path，otool 输出:\n{text}"
+    );
+    assert!(
+        !text.contains("$ORIGIN/../lib"),
+        "不应原样保留 $ORIGIN:\n{text}"
+    );
+}
+
+#[test]
+fn fetch_url_sha256_verifies() {
+    let d = tmpdir("sha256");
+    let pkgdir = d.join("archive-src");
+    write(&pkgdir.join("top/pkg.txt"), "sha256-content\n");
+    let archive = d.join("pkg.tar.gz");
+    let st = Command::new("tar")
+        .args(["-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&pkgdir)
+        .arg("top")
+        .status()
+        .unwrap();
+    assert!(st.success());
+    // 计算文件 sha256。
+    let hash_out = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    let good_hash = String::from_utf8_lossy(&hash_out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // 正确哈希：拉取成功。
+    write(
+        &d.join("ns-build.toml"),
+        &format!(
+            r#"
+[project]
+name = "shademo"
+
+[[fetch]]
+name = "mypkg"
+url = "file://{}"
+sha256 = "{}"
+strip_components = 1
+"#,
+            archive.display(),
+            good_hash
+        ),
+    );
+    let (_, err, code) = run_ns_build(&["fetch"], &d);
+    assert_eq!(code, 0, "正确 sha256 应通过: {err}");
+    assert_eq!(
+        std::fs::read_to_string(d.join(".ns-fetch/mypkg/pkg.txt")).unwrap(),
+        "sha256-content\n"
+    );
+
+    // 错误哈希：报错且不解压。
+    write(
+        &d.join("ns-build.toml"),
+        &format!(
+            r#"
+[project]
+name = "shademo"
+
+[[fetch]]
+name = "mypkg"
+url = "file://{}"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+strip_components = 1
+"#,
+            archive.display()
+        ),
+    );
+    let _ = std::fs::remove_dir_all(d.join(".ns-fetch"));
+    let (_, err, code) = run_ns_build(&["fetch"], &d);
+    assert_ne!(code, 0, "错误 sha256 必须失败");
+    assert!(err.contains("sha256"), "错误信息应包含 sha256: {err}");
+    assert!(
+        !d.join(".ns-fetch/mypkg/pkg.txt").exists(),
+        "哈希不匹配不应解压文件"
+    );
+
+    // git + sha256：禁止组合。
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "shademo"
+
+[[fetch]]
+name = "myrepo"
+git = "file:///tmp/repo"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+"#,
+    );
+    let (_, err, code) = run_ns_build(&["fetch"], &d);
+    assert_ne!(code, 0);
+    assert!(err.contains("sha256"), "git+sha256 应报错: {err}");
+}
+
+#[test]
+fn pkg_config_static_expands_closure() {
+    let d = tmpdir("pkgpc-static");
+    // 自定义 .pc：pkg-config 私有闭包包含 -lz。
+    let pc_dir = d.join("pc");
+    write(
+        &pc_dir.join("foo.pc"),
+        &format!(
+            "prefix={}\nlibdir=${{prefix}}/lib\nincludedir=${{prefix}}/include\n\nName: foo\nDescription: test pkg\nVersion: 1.0\nLibs: -L${{libdir}} -lfoo\nLibs.private: -lz\nCflags: -I${{includedir}}\n",
+            d.to_str().unwrap()
+        ),
+    );
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "staticpcdemo"
+
+[[targets]]
+name = "staticpcdemo"
+kind = "exe"
+sources = ["src/main.c"]
+pkg_config_static = ["foo"]
+"#,
+    );
+    write(
+        &d.join("src/main.c"),
+        "int foo(void);\nint main(void){return foo();}\n",
+    );
+    // 生成真实的 libfoo.a 供链接器找到。
+    write(&d.join("fooc.c"), "int foo(void){return 0;}\n");
+    let st = Command::new("cc")
+        .args(["-c"])
+        .arg(d.join("fooc.c"))
+        .arg("-o")
+        .arg(d.join("fooc.o"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    std::fs::create_dir_all(d.join("lib")).unwrap();
+    let st = Command::new("ar")
+        .args(["rcs"])
+        .arg(d.join("lib/libfoo.a"))
+        .arg(d.join("fooc.o"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    // 设置 PKG_CONFIG_PATH 指向自定义 .pc 目录。
+    std::env::set_var("PKG_CONFIG_PATH", &pc_dir);
+    let (_out, err, code) = run_ns_build(&["build", "--verbose"], &d);
+    std::env::remove_var("PKG_CONFIG_PATH");
+    assert_eq!(code, 0, "静态 pc 构建失败: {err}");
+    // 链接命令必须同时包含 -lfoo 和 -lz（--static 展开了 Libs.private）。
+    assert!(err.contains("-lfoo"), "链接行缺少 -lfoo: {err}");
+    assert!(err.contains("-lz"), "链接行缺少 -lz（Libs.private 应展开）: {err}");
+}
+
+#[test]
+fn imports_version_constraint() {
+    let d = tmpdir("import-version");
+    let a = d.join("mylib");
+    write(
+        &a.join("ns-build.toml"),
+        r#"
+[project]
+name = "mylib"
+version = "1.2.3"
+
+[[targets]]
+name = "mylib"
+kind = "static"
+sources = ["src/lib.c"]
+
+[[exports]]
+name = "mylib"
+"#,
+    );
+    write(&a.join("src/lib.c"), "int mylib_value(void){return 7;}\n");
+    let prefix = d.join("prefix");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix.to_str().unwrap()],
+        &a,
+    );
+    assert_eq!(code, 0, "export 安装失败: {err}");
+
+    // 满足约束 → 构建成功。
+    let ok_app = d.join("app-ok");
+    write(
+        &ok_app.join("ns-build.toml"),
+        &format!(
+            r#"
+[project]
+name = "app"
+
+[[imports]]
+from = "{}"
+name = "mylib"
+version = ">=1.0.0"
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+            prefix.display()
+        ),
+    );
+    write(&ok_app.join("src/main.c"), "int mylib_value(void);\nint main(void){return mylib_value();}\n");
+    let (_, err, code) = run_ns_build(&["build"], &ok_app);
+    assert_eq!(code, 0, "满足约束 >=1.0.0 应构建成功: {err}");
+
+    // 不满足约束 → 报错。
+    let bad_app = d.join("app-bad");
+    write(
+        &bad_app.join("ns-build.toml"),
+        &format!(
+            r#"
+[project]
+name = "app"
+
+[[imports]]
+from = "{}"
+name = "mylib"
+version = ">=2.0.0"
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+            prefix.display()
+        ),
+    );
+    write(&bad_app.join("src/main.c"), "int mylib_value(void);\nint main(void){return mylib_value();}\n");
+    let (_, err, code) = run_ns_build(&["build"], &bad_app);
+    assert_ne!(code, 0, "约束 >=2.0.0 必须失败");
+    assert!(err.contains("不满足"), "错误信息应含约束不满足: {err}");
+    assert!(err.contains("1.2.3"), "错误信息应含实际版本: {err}");
+
+    // 精确匹配：失败（1.0.0 != 1.2.3）。
+    let bad_exact = d.join("app-bad-exact");
+    write(
+        &bad_exact.join("ns-build.toml"),
+        &format!(
+            r#"
+[project]
+name = "app"
+
+[[imports]]
+from = "{}"
+name = "mylib"
+version = "1.0.0"
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+            prefix.display()
+        ),
+    );
+    write(&bad_exact.join("src/main.c"), "int mylib_value(void);\nint main(void){return mylib_value();}\n");
+    let (_, _err, code) = run_ns_build(&["build"], &bad_exact);
+    assert_ne!(code, 0, "精确版本约束不匹配必须失败");
+}
+
+#[test]
+fn install_custom_bindir_libdir_includedir() {
+    let d = tmpdir("custom-dirs");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "customdirdemo"
+version = "1.0.0"
+
+[install]
+libdir = "lib64"
+includedir = "include64"
+
+[[install_headers]]
+from = "include"
+files = ["**/*.h"]
+
+[[targets]]
+name = "mylib"
+kind = "static"
+sources = ["src/lib.c"]
+
+[[exports]]
+name = "mylib"
+pc = true
+
+[[targets]]
+name = "tool"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+    );
+    write(&d.join("include/mylib.h"), "int mylib_value(void);\n");
+    write(&d.join("src/lib.c"), "int mylib_value(void){return 99;}\n");
+    write(&d.join("src/main.c"), "int main(void){return 0;}\n");
+    let prefix = d.join("prefix");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix.to_str().unwrap()],
+        &d,
+    );
+    assert_eq!(code, 0, "install 失败: {err}");
+    // libdir 自定义。
+    assert!(prefix.join("lib64/libmylib.a").exists(), "lib64 下应有静态库");
+    // includedir 自定义。
+    assert!(prefix.join("include64/mylib.h").exists(), "include64 下应有头文件");
+    // .pc 指向自定义目录。
+    let pc = std::fs::read_to_string(prefix.join("lib64/pkgconfig/mylib.pc")).unwrap();
+    assert!(pc.contains("libdir=${exec_prefix}/lib64"), "pc libdir 错误: {pc}");
+    assert!(pc.contains("includedir=${prefix}/include64"), "pc includedir 错误: {pc}");
+    // exports 配置写入 lib64/cmake，且含 libdir。
+    let cfg = std::fs::read_to_string(prefix.join("lib64/cmake/mylib/mylib-config.toml")).unwrap();
+    assert!(cfg.contains("libdir = \"lib64\""), "config 缺 libdir: {cfg}");
+    // 可执行仍安装到默认 bin。
+    assert!(prefix.join("bin/tool").exists(), "默认 bindir 应为 bin");
+    // uninstall 清理 lib64 等。
+    let (out, err, code) = run_ns_build(
+        &["uninstall", "--prefix", prefix.to_str().unwrap()],
+        &d,
+    );
+    assert_eq!(code, 0, "uninstall 失败: {err}");
+    assert!(out.contains("卸载"), "输出应包含卸载汇总: {out}");
+    assert!(!prefix.join("lib64/libmylib.a").exists());
+    assert!(!prefix.join("include64/mylib.h").exists());
+    assert!(!prefix.join("lib64/cmake/mylib/mylib-config.toml").exists());
+    assert!(
+        !prefix.join("share/ns-build/customdirdemo.manifest").exists(),
+        "卸载后清单应删除"
+    );
+}
+
+#[test]
+fn export_import_roundtrip_with_custom_libdir() {
+    // 导库 + 导出到自定义 libdir（如 lib64），再被下游 import。
+    let d = tmpdir("lib64-roundtrip");
+    let prefix = d.join("prefix");
+
+    let mylib = d.join("mylib");
+    write(
+        &mylib.join("ns-build.toml"),
+        r#"
+[project]
+name = "mylib"
+version = "1.0.0"
+
+[install]
+libdir = "lib64"
+includedir = "include64"
+
+[[install_headers]]
+from = "include"
+to = "include64"
+files = ["**/*.h"]
+
+[[targets]]
+name = "mylib"
+kind = "static"
+sources = ["src/lib.c"]
+
+[[exports]]
+name = "mylib"
+pc = true
+"#,
+    );
+    write(&mylib.join("src/lib.c"), "int mylib_value(void){return 42;}\n");
+    write(&mylib.join("include/mylib.h"), "int mylib_value(void);\n");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix.to_str().unwrap()],
+        &mylib,
+    );
+    assert_eq!(code, 0, "export 安装失败: {err}");
+    assert!(prefix.join("lib64/libmylib.a").exists(), "lib64 下应有静态库");
+    assert!(prefix.join("lib64/cmake/mylib/mylib-config.toml").exists(), "lib64 下应有配置");
+    assert!(prefix.join("lib64/pkgconfig/mylib.pc").exists(), "lib64 下应有 pc");
+
+    // 下游：import 该 libdir 安装的 mylib。
+    let app = d.join("myapp");
+    write(
+        &app.join("ns-build.toml"),
+        &format!(
+            r#"
+[project]
+name = "myapp"
+
+[[imports]]
+from = "{}"
+name = "mylib"
+
+[[targets]]
+name = "myapp"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+            prefix.display()
+        ),
+    );
+    write(
+        &app.join("src/main.c"),
+        "#include <stdio.h>\n#include <mylib.h>\nint main(void){printf(\"%d\\n\", mylib_value());return 0;}\n",
+    );
+    let (_out, err, code) = run_ns_build(&["build", "--verbose"], &app);
+    assert_eq!(code, 0, "import lib64 配置失败: {err}");
+    assert!(err.contains("mylib.a"), "链接行应包含 libmylib.a: {err}");
+    let run = Command::new(app.join("build/myapp")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
+}
+
+#[test]
+fn audit_regressions_mixed_c_cpp_alias_filter_and_exports_private() {
+    // ── 混合 C/C++ 构建（language 缺省，按后缀推断）──
+    let d = tmpdir("mixed");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "mixeddemo"
+
+[[targets]]
+name = "mixeddemo"
+kind = "exe"
+sources = ["src/legacy.c", "src/ui.cpp"]
+"#,
+    );
+    write(&d.join("src/legacy.c"), "int answer(void){return 41;}\n");
+    write(&d.join("src/ui.cpp"), "extern \"C\" int answer(void);\nint main(void){return answer();}\n");
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "混合 C/C++ 构建失败: {err}");
+    let out = Command::new(d.join("build/mixeddemo")).output().unwrap();
+    assert_eq!(out.status.code(), Some(41));
+
+    // ── 依赖声明但被平台过滤的 target：不应报错 ──
+    let d2 = tmpdir("conddeps");
+    write(
+        &d2.join("ns-build.toml"),
+        r#"
+[project]
+name = "conddemo"
+
+[[targets]]
+name = "winonly"
+kind = "static"
+sources = ["src/win.c"]
+os = ["windows"]
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+deps = ["winonly"]
+"#,
+    );
+    write(&d2.join("src/win.c"), "int winf(void){return 1;}\n");
+    write(&d2.join("src/main.c"), "int main(void){return 0;}\n");
+    let (_, err, code) = run_ns_build(&["build"], &d2);
+    assert_eq!(code, 0, "条件依赖（被过滤）应不阻断构建: {err}");
+
+    // ── alias：ns-build build alias 成功（不只是 deps）──
+    let d3 = tmpdir("alias-cmd");
+    write(
+        &d3.join("ns-build.toml"),
+        r#"
+[project]
+name = "aliasdemo"
+
+[[targets]]
+name = "core"
+kind = "static"
+sources = ["src/core.c"]
+
+[[targets]]
+name = "corealias"
+kind = "alias"
+alias = "core"
+
+[[targets]]
+name = "app"
+kind = "exe"
+sources = ["src/main.c"]
+deps = ["corealias"]
+"#,
+    );
+    write(&d3.join("src/core.c"), "int answer(void){return 42;}\n");
+    write(&d3.join("src/main.c"), "extern int answer(void);\nint main(void){return answer();}\n");
+    // 直接构建 alias 目标本身，不应报错
+    let (_, err, code) = run_ns_build(&["build", "corealias"], &d3);
+    assert_eq!(code, 0, "build alias 失败: {err}");
+    assert!(d3.join("build/libcore.a").exists(), "alias 应解析到底层 target 并构建");
+
+    // ── exports 不要把 private 依赖泄漏到导出配置中 ──
+    let d4 = tmpdir("exports-private");
+    write(
+        &d4.join("ns-build.toml"),
+        r#"
+[project]
+name = "privdemo"
+version = "1.0.0"
+
+[[targets]]
+name = "secret"
+kind = "static"
+sources = ["src/secret.c"]
+defines = ["SECRET_TINY=9999"]
+
+[[targets]]
+name = "mylib"
+kind = "static"
+sources = ["src/lib.c"]
+private_deps = ["secret"]
+defines = ["PUBLIC_MACRO=1"]
+
+[[exports]]
+name = "privdemo"
+"#,
+    );
+    write(&d4.join("src/secret.c"), "int secret_value(void){return 1;}\n");
+    write(&d4.join("src/lib.c"), "int lib_value(void){return 2;}\n");
+    let prefix4 = d4.join("prefix");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix4.to_str().unwrap()],
+        &d4,
+    );
+    assert_eq!(code, 0, "export 安装失败: {err}");
+    let cfg = std::fs::read_to_string(
+        prefix4.join("lib/cmake/privdemo/privdemo-config.toml"),
+    )
+    .unwrap();
+    assert!(
+        cfg.contains("PUBLIC_MACRO=1"),
+        "export 配置应含公开定义: {cfg}"
+    );
+    // mylib 条目只应含它自己的宏，不应包含 private dep 宏。
+    assert!(cfg.contains("PUBLIC_MACRO=1"), "export 配置应含公开定义: {cfg}");
+    let mylib_idx = cfg.find("name = \"mylib\"").expect("mylib 应出现");
+    let mylib_section = &cfg[mylib_idx..];
+    let end = mylib_section
+        .find("\n[[")
+        .unwrap_or(mylib_section.len());
+    let mylib_block = &mylib_section[..end];
+    assert!(
+        !mylib_block.contains("SECRET_TINY"),
+        "mylib 条目不应泄漏 private dep 定义: {mylib_block}"
+    );
+}
+
+#[test]
+fn hooks_before_generated_header_flows_into_compile() {
+    let d = tmpdir("hook-gen");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "hookgendemo"
+
+[[targets]]
+name = "hookgendemo"
+kind = "exe"
+sources = ["src/main.c"]
+hooks.before = ["sh -c 'echo 42 > src/gen.h'"]
+"#,
+    );
+    write(
+        &d.join("src/main.c"),
+        "#include <stdio.h>\nint main(void){FILE *f = fopen(\"src/gen.h\",\"r\");int v=0;if(f){fscanf(f,\"%d\",&v);fclose(f);}printf(\"%d\\n\", v);return 0;}\n",
+    );
+    let (_, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "before 钩子应生成 gen.h: {err}");
+    let out = Command::new(d.join("build/hookgendemo")).current_dir(&d).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+#[test]
+fn install_rejects_out_of_prefix_install_headers() {
+    let d = tmpdir("escape-prefix");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "escapedemo"
+
+[[install_headers]]
+from = "include"
+to = "../escape"
+files = ["**/*.h"]
+
+[[targets]]
+name = "escapedemo"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+    );
+    write(&d.join("include/x.h"), "#define X 1\n");
+    write(&d.join("src/main.c"), "int main(void){return 0;}\n");
+    let prefix = d.join("prefix");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix.to_str().unwrap()],
+        &d,
+    );
+    assert_ne!(code, 0, "超出 prefix 的 install_headers.to 必须报错");
+    assert!(err.contains("越出前缀") || err.contains("escape"), "错误信息应指出越界: {err}");
+    assert!(!d.join("escape/x.h").exists(), "不应写出 prefix 所在目录");
+}
+
+#[test]
+fn java_target_can_run_and_cache() {
+    if Command::new("javac").arg("-version").output().is_err() {
+        eprintln!("跳过 java: javac 不可用");
+        return;
+    }
+    let d = tmpdir("java-run");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "jrundemo"
+
+[[targets]]
+name = "jrundemo"
+kind = "exe"
+language = "java"
+sources = ["src/Main.java"]
+"#,
+    );
+    write(
+        &d.join("src/Main.java"),
+        "public class Main { public static void main(String[] args) { System.out.println(\"java-run-ok\"); } }\n",
+    );
+    // build 两次，验证增量缓存生效（第二次应全部跳过）
+    let (out, err, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0, "java 构建失败: {err}");
+    assert!(out.contains("1 构建"), "首次构建应有 1 个任务: {out}");
+    let (out, _, code) = run_ns_build(&["build"], &d);
+    assert_eq!(code, 0);
+    assert!(out.contains("0 构建"), "第二次构建应全部跳过: {out}");
+    // ns-build run 可以直接运行 java 类
+    let (out, err, code) = run_ns_build(&["run", "jrundemo"], &d);
+    assert_eq!(code, 0, "java run 失败: {err}");
+    assert!(out.contains("java-run-ok"), "java 输出不正确: {out}");
+}
+
+#[test]
+fn install_directory_handles_symlink_loops() {
+    let d = tmpdir("symlink-loop");
+    write(
+        &d.join("ns-build.toml"),
+        r#"
+[project]
+name = "symlinkdemo"
+
+[[install_files]]
+dir = "dir"
+to = "share/symlinkdemo"
+
+[[targets]]
+name = "symlinkdemo"
+kind = "exe"
+sources = ["src/main.c"]
+"#,
+    );
+    write(&d.join("src/main.c"), "int main(void){return 0;}\n");
+    write(&d.join("dir/local.txt"), "hello\n");
+    // 构建一个指向不存在的/不可访问位置的符号链接环，install 应能通过而不挂起。
+    std::os::unix::fs::symlink(d.join("dir"), d.join("dir/loop")).unwrap();
+    let prefix = d.join("prefix");
+    let (_, err, code) = run_ns_build(
+        &["install", "--prefix", prefix.to_str().unwrap()],
+        &d,
+    );
+    assert_eq!(code, 0, "含符号链接环的目录安装不应失败/挂起: {err}");
+    assert!(prefix.join("share/symlinkdemo/local.txt").exists());
 }
 
 #[test]

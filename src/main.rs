@@ -7,7 +7,7 @@ use ns_build::cache::Cache;
 use ns_build::executor::{ExecOptions, execute};
 use ns_build::install::{InstallReport, install_all};
 use ns_build::planner::plan;
-use ns_build::runner::{find_exe, run_one, run_tests};
+use ns_build::runner::{detect_java_main_class, find_exe, run_java, run_one, run_tests};
 use ns_build::script::load;
 
 const USAGE: &str = r#"ns-build — 现代化跨平台构建系统
@@ -16,13 +16,15 @@ const USAGE: &str = r#"ns-build — 现代化跨平台构建系统
   ns-build build [--release|--debug|--profile <配置>] [-j N] [--verbose] [--quiet] [目标...]
   ns-build clean
   ns-build test [--all] [--label <标签>] [-j N]
-  ns-build install [--prefix <路径>]
+  ns-build install [--prefix <路径>] [--strip]
   ns-build run <目标> [-- 参数...]
-  ns-build show
+  ns-build show [--json]
   ns-build graph
   ns-build presets
   ns-build fetch [--update]
-  ns-build package [--format tar.gz|zip] [--name <名>] [--dest <目录>]
+  ns-build doctor
+  ns-build uninstall [--prefix <路径>] [--name <包名>]
+  ns-build package [--format tar.gz|zip] [--name <名>] [--dest <目录>] [--strip]
   ns-build init [--name <名>]
 
 选项:
@@ -60,11 +62,13 @@ fn run(args: &[String]) -> Result<(), String> {
         "test" | "t" => cmd_test(&args[1..]),
         "install" => cmd_install(&args[1..]),
         "run" => cmd_run(&args[1..]),
-        "show" => cmd_show(),
+        "show" => cmd_show(&args[1..]),
         "graph" => cmd_graph(),
         "init" => cmd_init(&args[1..]),
         "presets" => cmd_presets(),
         "fetch" => cmd_fetch(&args[1..]),
+        "uninstall" | "uninstall-package" => cmd_uninstall(&args[1..]),
+        "doctor" => cmd_doctor(),
         "package" | "pack" => cmd_package(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
@@ -197,8 +201,10 @@ fn expand_targets(
     let mut allowed: BTreeSet<String> = BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
     for name in requested {
+        // 请求可经 alias 解析到底层目标（alias 即等价：ns-build build myalias == build mytarget）。
+        let unaliased = ns_build::script::unalias(name, &script.targets);
         let t = by_name
-            .get(name.as_str())
+            .get(unaliased.as_str())
             .ok_or_else(|| format!("未知目标 '{name}'"))?;
         stack.push(t.name.clone());
     }
@@ -208,8 +214,9 @@ fn expand_targets(
         }
         if let Some(t) = by_name.get(name.as_str()) {
             for dep in t.deps.iter().chain(t.private_deps.iter()) {
-                if !allowed.contains(dep) {
-                    stack.push(dep.clone());
+                let dep = ns_build::script::unalias(dep, &script.targets);
+                if !allowed.contains(&dep) {
+                    stack.push(dep);
                 }
             }
         }
@@ -449,7 +456,8 @@ fn cmd_test(args: &[String]) -> Result<(), String> {
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
     let resolved = script.resolve_default(&script_dir)?;
-    let report = run_tests(&resolved, all, &labels)?;
+    let parallel = jobs.unwrap_or(resolved.parallel);
+    let report = run_tests(&resolved, all, &labels, parallel)?;
     println!(
         "[ns-build] 测试: {} 通过, {} 失败, {} 跳过",
         report.passed, report.failed, report.skipped
@@ -462,10 +470,12 @@ fn cmd_test(args: &[String]) -> Result<(), String> {
 
 fn cmd_install(args: &[String]) -> Result<(), String> {
     let mut prefix: Option<PathBuf> = None;
+    let mut strip = false;
     let mut build_args = vec!["--quiet".to_string()];
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--strip" => strip = true,
             "--prefix" => {
                 i += 1;
                 prefix = Some(PathBuf::from(args.get(i).ok_or("--prefix 需要参数")?));
@@ -491,7 +501,7 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
                 build_args.retain(|a| a != "--quiet");
             }
             "-h" | "--help" => {
-                println!("用法: ns-build install [--prefix <路径>] [-j N] [--release|--debug] [--define name=value]");
+                println!("用法: ns-build install [--prefix <路径>] [--strip] [-j N] [--release|--debug] [--define name=value]");
                 return Ok(());
             }
             other => return Err(format!("未知选项 '{other}'")),
@@ -504,7 +514,8 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     let (script, script_dir) = load(&dir)?;
     let resolved = script.resolve_default(&script_dir)?;
     let prefix = prefix.unwrap_or_else(ns_build::install::default_prefix);
-    let report: InstallReport = install_all(&resolved, &prefix)?;
+    let opts = ns_build::install::InstallOptions { strip };
+    let report: InstallReport = install_all(&resolved, &prefix, opts)?;
     println!(
         "[ns-build] 安装: {} 已安装, {} 跳过 → {}",
         report.installed, report.skipped, prefix.display()
@@ -532,6 +543,26 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
     let resolved = script.resolve_default(&script_dir)?;
+    // Java 目标：输出是 classes 目录，用 java -cp 运行。
+    let java_target = resolved
+        .targets
+        .iter()
+        .find(|t| t.name == ns_build::script::unalias(&target, &resolved.targets))
+        .filter(|t| t.language == ns_build::script::Language::Java);
+    if let Some(jt) = java_target {
+        let class_dir = &jt.output;
+        let Some(main_class) = detect_java_main_class(&jt.sources) else {
+            return Err(format!(
+                "Java 目标 '{target}'：找不到 main class（sources 中未找到 `public class`）"
+            ));
+        };
+        let status = run_java(class_dir, &main_class, &run_args)
+            .map_err(|e| format!("启动 java 失败: {e}"))?;
+        if !status.success() {
+            return Err(format!("Java 目标 '{target}' 退出码 {:?}", status.code()));
+        }
+        return Ok(());
+    }
     let Some(path) = find_exe(&resolved, &target) else {
         return Err(format!("找不到可执行目标 '{target}'"));
     };
@@ -545,10 +576,44 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_show() -> Result<(), String> {
+fn cmd_show(args: &[String]) -> Result<(), String> {
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
     let resolved = script.resolve_default(&script_dir)?;
+    if args.iter().any(|a| a == "--json") {
+        let targets: Vec<serde_json::Value> = resolved
+            .targets
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "kind": kind_str(t.kind),
+                    "language": t.language.as_str(),
+                    "source_count": t.sources.len(),
+                    "sources": t.sources.iter().map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+                    "output": t.output.to_string_lossy().into_owned(),
+                    "deps": t.deps,
+                    "private_deps": t.private_deps,
+                    "parallel": t.parallel,
+                    "install": t.install,
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "project": {
+                "name": resolved.script.project.name,
+                "version": resolved.script.project.version,
+                "out": resolved.out_dir.to_string_lossy(),
+            },
+            "parallel": resolved.parallel,
+            "targets": targets,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
     println!("project: {} {}", resolved.script.project.name, resolved.script.project.version);
     println!("out: {}", resolved.out_dir.display());
     println!("parallel: {}", resolved.parallel);
@@ -664,11 +729,24 @@ fn fetch_one(f: &ns_build::script::Fetch, fetch_root: &std::path::Path, update: 
                 .map_err(|e| format!("删除 {} 失败: {e}", dest.display()))?;
         }
     }
+    if f.sha256.is_some() && f.git.is_some() {
+        return Err(format!(
+            "fetch '{name}'：sha256 仅与 url 搭配（git 用 rev 固定版本）"
+        ));
+    }
+    if let Some(h) = &f.sha256 {
+        let h = h.trim();
+        if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "fetch '{name}'：sha256 必须是 64 位十六进制（得到 '{h}'）"
+            ));
+        }
+    }
     match (&f.git, &f.url) {
         (Some(_), Some(_)) => Err(format!("fetch '{name}'：git 与 url 只能二选一")),
         (None, None) => Err(format!("fetch '{name}'：需要 git 或 url")),
         (Some(git), None) => fetch_git(name, git, f.rev.as_deref(), &dest),
-        (None, Some(url)) => fetch_url(name, url, f.strip_components, &dest),
+        (None, Some(url)) => fetch_url(name, url, f.strip_components, &dest, f.sha256.as_deref()),
     }
 }
 
@@ -706,7 +784,7 @@ fn fetch_git(name: &str, git: &str, rev: Option<&str>, dest: &std::path::Path) -
     Ok(())
 }
 
-fn fetch_url(name: &str, url: &str, strip_components: usize, dest: &std::path::Path) -> Result<(), String> {
+fn fetch_url(name: &str, url: &str, strip_components: usize, dest: &std::path::Path, sha256: Option<&str>) -> Result<(), String> {
     println!("[ns-build] 下载 {url} -> {}", dest.display());
     std::fs::create_dir_all(dest).map_err(|e| format!("创建 {} 失败: {e}", dest.display()))?;
     // 下载到临时文件（系统 temp 目录下，按进程隔离）。
@@ -723,6 +801,22 @@ fn fetch_url(name: &str, url: &str, strip_components: usize, dest: &std::path::P
     if !st.success() {
         return Err(format!("fetch '{name}'：下载失败（{url}）"));
     }
+    // sha256 完整性校验（URL_HASH 对等）：不匹配直接报错，不解压。
+    if let Some(expected) = sha256 {
+        let data = std::fs::read(&tmp).map_err(|e| format!("fetch '{name}'：读取下载文件失败: {e}"))?;
+        use sha2::Digest;
+        let actual = format!("{:x}", sha2::Sha256::digest(&data));
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "fetch '{name}'：sha256 不匹配（预期 {}，实际 {}）",
+                expected.trim().to_lowercase(),
+                actual
+            ));
+        }
+        println!("[ns-build] 校验 sha256 ✔");
+    }
+
     let lower = url.to_lowercase();
     let is_zip = lower.ends_with(".zip");
     let is_tgz = lower.ends_with(".tar.gz") || lower.ends_with(".tgz");
@@ -778,9 +872,11 @@ fn cmd_package(args: &[String]) -> Result<(), String> {
     let mut format = "tar.gz".to_string();
     let mut name: Option<String> = None;
     let mut dest_dir: Option<String> = None;
+    let mut strip = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--strip" => strip = true,
             "--format" | "-f" => {
                 i += 1;
                 let v = args.get(i).ok_or("--format 需要 tar.gz 或 zip")?;
@@ -805,7 +901,7 @@ fn cmd_package(args: &[String]) -> Result<(), String> {
                 dest_dir = Some(args.get(i).ok_or("--dest 需要参数")?.clone());
             }
             "--help" | "-h" => {
-                println!("ns-build package [--format tar.gz|zip] [--name <名>] [--dest <目录>]");
+                println!("ns-build package [--format tar.gz|zip] [--name <名>] [--dest <目录>] [--strip]");
                 return Ok(());
             }
             v => return Err(format!("未知选项 '{v}'（ns-build package [--format tar.gz|zip]）")),
@@ -824,7 +920,8 @@ fn cmd_package(args: &[String]) -> Result<(), String> {
         std::fs::remove_dir_all(&staging)
             .map_err(|e| format!("清理 staging {} 失败: {e}", staging.display()))?;
     }
-    let install_report = ns_build::install::install_all(&resolved, &staging)?;
+    let install_opts = ns_build::install::InstallOptions { strip };
+    let install_report = ns_build::install::install_all(&resolved, &staging, install_opts)?;
     if install_report.installed == 0 && install_report.skipped == 0 {
         return Err("package：没有可打包的安装产物（install 规则为空）".into());
     }
@@ -895,6 +992,95 @@ fn cmd_package(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `ns-build doctor`：环境自检——列出外部工具是否可用及其版本。
+fn cmd_doctor() -> Result<(), String> {
+    let probes: &[(&str, &[&str])] = &[
+        ("cc", &["--version"]),
+        ("c++", &["--version"]),
+        ("ar", &["--version"]),
+        ("git", &["--version"]),
+        ("curl", &["--version"]),
+        ("tar", &["--version"]),
+        ("pkg-config", &["--version"]),
+        ("cmake", &["--version"]),
+        ("ninja", &["--version"]),
+        ("zip", &["--version"]),
+        ("python3", &["--version"]),
+        ("java", &["-version"]),
+        ("go", &["version"]),
+        ("rustc", &["--version"]),
+        ("zig", &["version"]),
+    ];
+    println!("[ns-build] 环境自检：");
+    let mut missing = 0usize;
+    for (name, args) in probes {
+        match std::process::Command::new(name).args(*args).output() {
+            Ok(o) => {
+                let first = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .chain(String::from_utf8_lossy(&o.stderr).lines())
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if o.status.success() {
+                    println!("  [ok]      {name:<12} {first}");
+                } else {
+                    println!("  [fail]    {name:<12} 存在但 --version 报错");
+                    missing += 1;
+                }
+            }
+            Err(_) => {
+                println!("  [missing] {name:<12} 未找到");
+                missing += 1;
+            }
+        }
+    }
+    println!("[ns-build] {missing} 个工具不可用");
+    Ok(())
+}
+
+/// `ns-build uninstall`：按 install 生成的清单删除安装文件（CPack --uninstall 对等）。
+fn cmd_uninstall(args: &[String]) -> Result<(), String> {
+    let mut prefix: Option<PathBuf> = None;
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--prefix" => {
+                i += 1;
+                prefix = Some(PathBuf::from(args.get(i).ok_or("--prefix 需要参数")?));
+            }
+            "--name" => {
+                i += 1;
+                name = Some(args.get(i).ok_or("--name 需要参数")?.clone());
+            }
+            "--help" | "-h" => {
+                println!("用法: ns-build uninstall [--prefix <路径>] [--name <包名>]");
+                return Ok(());
+            }
+            other => return Err(format!("未知选项 '{other}'")),
+        }
+        i += 1;
+    }
+    let dir = std::env::current_dir().map_err(|e| e.to_string())?;
+    // 默认包名：当前项目（缺省时要求 --name）。
+    let pkg = match name {
+        Some(n) => n,
+        None => {
+            let (script, _) = load(&dir)?;
+            script.project.name
+        }
+    };
+    let prefix = prefix.unwrap_or_else(ns_build::install::default_prefix);
+    let report = ns_build::install::uninstall_all(&prefix, &pkg)?;
+    println!(
+        "[ns-build] 卸载 {pkg}: 删除 {} 个文件, 缺失 {} 个, 清理 {} 个空目录 → {}",
+        report.removed, report.missing, report.dirs_removed, prefix.display()
+    );
+    Ok(())
+}
+
 fn cmd_graph() -> Result<(), String> {
     let dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let (script, script_dir) = load(&dir)?;
@@ -939,6 +1125,8 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
         r#"[project]
 name = "{name}"
 version = "0.1.0"
+description = "A new ns-build project"
+license = "MIT"
 root = "src"
 out = "build"
 
@@ -975,6 +1163,7 @@ fn kind_str(k: ns_build::TargetKind) -> &'static str {
         ns_build::TargetKind::Phony => "phony",
         ns_build::TargetKind::Module => "module",
         ns_build::TargetKind::Interface => "interface",
+        ns_build::TargetKind::Alias => "alias",
     }
 }
 

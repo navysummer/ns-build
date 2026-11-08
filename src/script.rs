@@ -29,15 +29,17 @@ pub enum TargetKind {
     Module,
     /// INTERFACE 头文件库：只传递 include/宏，无产物。
     Interface,
+    /// 别名目标：零开销指向另一个 target（CMake `add_library(ALIAS)` 等价）。
+    Alias,
 }
 
 impl TargetKind {
     pub fn is_linkable(&self) -> bool {
         matches!(self, Self::Exe | Self::Lib | Self::Static | Self::Module)
     }
-    /// 是否产生产物（interface/phony 无产物）。
+    /// 是否产生产物（interface/phony/alias 无产物）。
     pub fn produces_output(&self) -> bool {
-        !matches!(self, Self::Phony | Self::Interface)
+        !matches!(self, Self::Phony | Self::Interface | Self::Alias)
     }
 }
 
@@ -98,6 +100,7 @@ impl Default for Command {
 /// 构建钩子：目标构建前/后运行的自定义命令。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Hooks {
     pub before: Vec<Command>,
     pub after: Vec<Command>,
@@ -106,6 +109,7 @@ pub struct Hooks {
 /// 顶层 `[project]` 配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Project {
     pub name: String,
     pub version: String,
@@ -113,6 +117,10 @@ pub struct Project {
     pub root: String,
     /// 产物输出目录（相对脚本目录）。
     pub out: String,
+    /// 项目描述（进入导出的 `.pc` 的 Description）。
+    pub description: String,
+    /// 许可证名（如 "MIT"），记录进导出配置。
+    pub license: String,
 }
 
 impl Default for Project {
@@ -122,6 +130,8 @@ impl Default for Project {
             version: "0.1.0".into(),
             root: ".".into(),
             out: "build".into(),
+            description: String::new(),
+            license: String::new(),
         }
     }
 }
@@ -162,6 +172,7 @@ impl Profile {
 /// 默认编译/链接设置（`[defaults]`），target 可覆盖。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Defaults {
     pub cc: String,
     pub cxx: String,
@@ -171,6 +182,7 @@ pub struct Defaults {
     pub cxxflags: Vec<String>,
     pub link_flags: Vec<String>,
     pub include_dirs: Vec<String>,
+    pub link_dirs: Vec<String>,
     pub defines: Vec<String>,
     pub profile: Option<Profile>,
     /// 并行度；`None` = CPU 核数。
@@ -182,6 +194,8 @@ pub struct Defaults {
     pub strip: bool,
     pub warnings: bool,
     pub werror: bool,
+    /// LTO：默认关闭（`-flto` / `/GL+/LTCG`）。
+    pub lto: bool,
     pub cache: String,
     /// 变量表：`${name}` 在脚本字符串中替换。
     pub variables: BTreeMap<String, String>,
@@ -198,6 +212,7 @@ impl Default for Defaults {
             cxxflags: vec![],
             link_flags: vec![],
             include_dirs: vec![],
+            link_dirs: vec![],
             defines: vec![],
             profile: None,
             parallel: None,
@@ -206,6 +221,7 @@ impl Default for Defaults {
             strip: false,
             warnings: true,
             werror: false,
+            lto: false,
             cache: ".ns-cache".into(),
             variables: BTreeMap::new(),
         }
@@ -217,6 +233,7 @@ impl Default for Defaults {
 /// 交叉编译工具链（`[[toolchains]]`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Toolchain {
     pub name: String,
     pub cc: String,
@@ -233,6 +250,7 @@ pub struct Toolchain {
 /// 单个 target。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Target {
     pub name: String,
     pub kind: TargetKind,
@@ -264,8 +282,12 @@ pub struct Target {
     pub private_deps: Vec<String>,
     /// pkg-config 包名：链接时展开 `pkg-config --libs`。
     pub pkg_config: Vec<String>,
+    /// pkg-config 包名（静态）：链接展开 `pkg-config --libs --static`（含 Libs.private 的闭包依赖）。
+    pub pkg_config_static: Vec<String>,
     /// 产物名（相对 out 目录）；默认按 target 名 + 平台后缀。
     pub output: Option<String>,
+    /// 别名目标的最终指向（`kind = "alias"` 必填）：`alias = "real-target"`。
+    pub alias: Option<String>,
     /// 分步构建：将源文件分为 N 组，每组编译为一个 `.o`.
     pub groups: Option<usize>,
     /// 每组源文件数（与 groups 二选一）。
@@ -288,6 +310,8 @@ pub struct Target {
     pub rpath: Vec<String>,
     /// 警告即错误（-Werror / /WX）；默认取 defaults.werror。
     pub werror: Option<bool>,
+    /// 链接时优化（-flto / /GL+/LTCG）；默认取 defaults.lto。
+    pub lto: Option<bool>,
     /// 产物是否安装（供 `install` 用）；默认 true。
     pub install: Option<bool>,
     /// 条件构建表达式（`when`）：如 `os == "linux" && arch == "x86_64"`.
@@ -323,6 +347,7 @@ impl PchValue {
 /// 解析期做一次 try-compile+link，结果注入 `${name}` 变量（1/0）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Check {
     /// 名字（同时用作 `${name}` 变量名）。
     pub name: String,
@@ -346,6 +371,7 @@ pub struct Check {
 /// 生成文件，供 targets 作为源/输入使用；生命周期与缓存接入与普通任务一致。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct CustomCommand {
     /// 名字（日志/错误消息；缺省 `custom_<索引>`）。
     pub name: String,
@@ -363,6 +389,7 @@ pub struct CustomCommand {
 /// 命令行显式传入的选项优先于预设中的值。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Preset {
     /// 优化配置覆盖。
     pub profile: Option<Profile>,
@@ -382,6 +409,7 @@ pub struct Preset {
 /// 由 `ns-build fetch` 执行；构建本身不需要网络。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Fetch {
     /// 包名（拉取到 `.ns-fetch/<name>/`）；仅字母数字/`-`/`_`。
     pub name: String,
@@ -391,13 +419,40 @@ pub struct Fetch {
     pub rev: Option<String>,
     /// 压缩包地址（`.tar.gz`/`.tgz`/`.tar`/`.zip`；支持本地 `file://`）。
     pub url: Option<String>,
+    /// 压缩包的 sha256（十六进制；仅 `url` 的下载生效）。不匹配即报错。
+    pub sha256: Option<String>,
     /// 解压时去掉的目录层数（仅 tar；默认 0）。
     pub strip_components: usize,
+}
+
+/// 安装目录名（CMake `CMAKE_INSTALL_BINDIR` 等价）。
+/// 控制 `ns-build install` / `package` / `uninstall` 与导出的 `.pc` 布局。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct InstallDirs {
+    /// 可执行文件目录（默认 `bin`）。
+    pub bindir: String,
+    /// 库文件目录（默认 `lib`）。
+    pub libdir: String,
+    /// 头文件目录（默认 `include`）。
+    pub includedir: String,
+}
+
+impl Default for InstallDirs {
+    fn default() -> Self {
+        Self {
+            bindir: "bin".into(),
+            libdir: "lib".into(),
+            includedir: "include".into(),
+        }
+    }
 }
 
 /// 安装包导出（CMake `install(EXPORT)` 等价）：生成 `<name>-config.toml`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Export {
     /// 导出包名（配置文件名 `<name>-config.toml`）。
     pub name: String,
@@ -414,16 +469,21 @@ pub struct Export {
 /// 导入已安装的包（CMake `find_package` 等价）：其使用要求并入所有目标。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Import {
     /// 前缀目录、配置文件路径或包含 `<name>-config.toml` 的目录。
     pub from: String,
     /// 包名（`from` 是目录时必填；`from` 是文件时可从文件名推断）。
     pub name: String,
+    /// 版本约束：`>=1.2.0` / `<=2.0.0` / `>1.0` / `<2.0` / `=1.2.3` / `!=1.0.0`，
+    /// 不带操作符等价 `=`（精确匹配）。空 = 不约束。
+    pub version: Option<String>,
 }
 
 /// 头文件安装规则。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct InstallHeader {
     /// 源目录（相对脚本）。
     pub from: String,
@@ -436,6 +496,7 @@ pub struct InstallHeader {
 /// 通用文件安装规则（对应 CMake `install(FILES/DIRECTORY)`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct InstallFile {
     /// 源：文件或 glob 模式（相对脚本），或目录（`dir` 时）。
     pub files: Vec<String>,
@@ -457,6 +518,7 @@ fn default_true() -> bool {
 /// 完整构建脚本。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct BuildScript {
     pub project: Project,
     pub defaults: Defaults,
@@ -476,6 +538,8 @@ pub struct BuildScript {
     pub fetch: Vec<Fetch>,
     /// 构建预设（`[presets]` 表，CMake `--preset` 等价）。
     pub presets: BTreeMap<String, Preset>,
+    /// 安装目录名（`[install]` 节）。
+    pub install: InstallDirs,
     /// 头文件安装规则（`[[install_headers]]`）。
     pub install_headers: Vec<InstallHeader>,
     /// 通用文件安装规则（`[[install_files]]`）。
@@ -488,6 +552,7 @@ pub struct BuildScript {
 /// 显式测试用例。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct TestSpec {
     /// 测试名。
     pub name: String,
@@ -532,6 +597,8 @@ pub struct ResolvedTarget {
     pub deps: Vec<String>,
     pub private_deps: Vec<String>,
     pub output: PathBuf,
+    /// 别名目标最终指向（仅 alias kind 有意义）。
+    pub alias: Option<String>,
     pub groups: Option<usize>,
     pub group_size: Option<usize>,
     pub parallel: bool,
@@ -540,6 +607,7 @@ pub struct ResolvedTarget {
     pub strip: bool,
     pub warnings: bool,
     pub werror: bool,
+    pub lto: bool,
     /// 已规范化的 rpath 目录（绝对路径或 $ORIGIN 模板，原样传递）。
     pub rpath: Vec<String>,
     /// 动态库 soversion（unix 有效；决定输出文件名与 soname/install_name）。
@@ -548,6 +616,7 @@ pub struct ResolvedTarget {
     pub c_std: Option<String>,
     pub cxx_std: Option<String>,
     pub pkg_config: Vec<String>,
+    pub pkg_config_static: Vec<String>,
     pub when: Option<String>,
     pub pch: Vec<String>,
 }
@@ -574,6 +643,37 @@ pub struct ResolvedScript {
     pub custom_commands: Vec<ResolvedCustomCommand>,
     pub parallel: usize,
     pub host: Host,
+    /// 当前脚本（含子脚本）中**所有声明过的** target 名（含被平台/when 过滤掉的）。
+    /// 供依赖校验区分"未声明"（报错）与"声明但被过滤"（合法，跳过）。
+    pub declared: Vec<String>,
+    /// 每个 target 的导出集（self + 公开传递依赖，private 不泄漏）。
+    pub(crate) export_sets: Vec<ExportSet>,
+}
+
+/// 脚本解析的继承上下文（include/递归解析时跨调用传递）。
+#[derive(Clone, Copy)]
+struct ResolveInherit<'a> {
+    overrides: &'a BTreeMap<String, String>,
+    cli_profile: Option<Profile>,
+    inherited_customs: &'a BTreeSet<PathBuf>,
+    inherited_out: Option<&'a Path>,
+    inherited_cache: Option<&'a Path>,
+    inherited_vars: &'a BTreeMap<String, String>,
+}
+
+impl<'a> ResolveInherit<'a> {
+    fn root(overrides: &'a BTreeMap<String, String>, cli_profile: Option<Profile>) -> Self {
+        static EMPTY_SET: std::sync::OnceLock<BTreeSet<PathBuf>> = std::sync::OnceLock::new();
+        static EMPTY_MAP: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+        Self {
+            overrides,
+            cli_profile,
+            inherited_customs: EMPTY_SET.get_or_init(BTreeSet::new),
+            inherited_out: None,
+            inherited_cache: None,
+            inherited_vars: EMPTY_MAP.get_or_init(BTreeMap::new),
+        }
+    }
 }
 
 /// `resolve_target` 的共享上下文（单次 `resolve` 调用内不变）。
@@ -609,32 +709,68 @@ impl BuildScript {
         overrides: &BTreeMap<String, String>,
         cli_profile: Option<Profile>,
     ) -> Result<ResolvedScript, String> {
-        self.resolve_impl(dir, overrides, cli_profile, &BTreeSet::new())
+        let mut visited = BTreeSet::new();
+        let ctx = ResolveInherit::root(overrides, cli_profile);
+        self.resolve_impl(dir, &ctx, &mut visited)
     }
 
-    /// `inherited_customs`：父脚本中自定义命令声明的产物（供 include 子脚本
-    /// 在 source 存在性检查时识别跨文件生成源）。
+    /// `visited`：已解析过的脚本目录集合（diamond include 去重 + 环保护，
+    /// 与 CMake `include_guard(GLOBAL)` 语义一致）。根脚本严格校验依赖，子脚本宽松。
     fn resolve_impl(
         &self,
         dir: &Path,
-        overrides: &BTreeMap<String, String>,
-        cli_profile: Option<Profile>,
-        inherited_customs: &BTreeSet<PathBuf>,
+        ctx: &ResolveInherit<'_>,
+        visited: &mut BTreeSet<PathBuf>,
     ) -> Result<ResolvedScript, String> {
         let dir = dir
             .canonicalize()
             .unwrap_or_else(|_| dir.to_path_buf());
+        // 是否为根脚本（visited 尚无任何项）：根脚本严格校验依赖，子脚本宽松
+        //（跨分支依赖延后到根脚本统一处理）。
+        let is_root = visited.is_empty();
+        // 同一脚本已被解析过（diamond / 环）：静默返回空（include_guard(GLOBAL) 语义）。
+        if !visited.insert(dir.clone()) {
+            return Ok(ResolvedScript {
+                script: self.clone(),
+                dir: dir.clone(),
+                out_dir: ctx
+                    .inherited_out
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| dir.join(&self.project.out)),
+                cache_dir: ctx
+                    .inherited_cache
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| dir.join(&self.defaults.cache)),
+                targets: vec![],
+                custom_commands: vec![],
+                parallel: 1,
+                host: Host::current(),
+                declared: self.targets.iter().map(|t| t.name.clone()).collect(),
+                export_sets: vec![],
+            });
+        }
         let host = Host::current();
-        let out_dir = dir.join(&self.project.out);
-        let cache_dir = dir.join(&self.defaults.cache);
+        // 子脚本的产物与缓存统一写到根脚本的 out/cache 目录（对应 CMake 子目录构建共享根 build）。
+        let out_dir = ctx
+            .inherited_out
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| dir.join(&self.project.out));
+        let cache_dir = ctx
+            .inherited_cache
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| dir.join(&self.defaults.cache));
         let parallel = self
             .defaults
             .parallel
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
 
-        // 变量表：defaults.variables + CLI 覆盖。
-        let mut vars = self.defaults.variables.clone();
-        for (k, v) in overrides {
+        // 变量表：先从父脚本继承（include 子脚本可读到根目录的变量，对应 CMake include() 同作用域语义），
+        // 再合并子脚本自己的 [defaults].variables（子脚本可覆盖父脚本），最后 CLI --define 最高优先级。
+        let mut vars = ctx.inherited_vars.clone();
+        for (k, v) in &self.defaults.variables {
+            vars.insert(k.clone(), v.clone());
+        }
+        for (k, v) in ctx.overrides {
             vars.insert(k.clone(), v.clone());
         }
         // 内置变量。
@@ -652,6 +788,17 @@ impl BuildScript {
                 return Err("import：from 不能为空".into());
             }
             let loaded = crate::export::load_import(&dir, &imp.from, imp.name.trim())?;
+            // 版本约束校验（find_package 的 REQUIRED 版本对等）。
+            if let Some(req) = &imp.version {
+                if !crate::export::version_matches(req, &loaded.config.package.version)
+                    .map_err(|e| format!("import '{}': {e}", imp.name))?
+                {
+                    return Err(format!(
+                        "import '{}'：导出包版本 '{}' 不满足约束 '{}'",
+                        imp.name, loaded.config.package.version, req
+                    ));
+                }
+            }
             let pfx = &loaded.prefix;
             for t in &loaded.config.targets {
                 for i in &t.include_dirs {
@@ -670,11 +817,24 @@ impl BuildScript {
                         import_defines.push(d.clone());
                     }
                 }
-                // 产物：以绝对路径参与链接（如同 install 后的静态库路径）。
+                // 产物：以绝对路径参与链接（安装目录名取自导出配置的 libdir，默认 lib）。
                 if !t.output.is_empty() {
-                    let artifact = pfx.join("lib").join(&t.output);
+                    let libdir = if loaded.config.package.libdir.is_empty() {
+                        "lib"
+                    } else {
+                        &loaded.config.package.libdir
+                    };
+                    let artifact = pfx.join(libdir).join(&t.output);
                     let s = artifact.to_string_lossy().into_owned();
-                    if artifact.is_file() && !import_link.contains(&s) {
+                    if !artifact.is_file() {
+                        return Err(format!(
+                            "import '{}'：导出配置声明产物 {}，但文件不存在（{}）。请确认库已安装。",
+                            imp.name,
+                            t.name,
+                            artifact.display()
+                        ));
+                    }
+                    if !import_link.contains(&s) {
                         import_link.push(s);
                     }
                 }
@@ -713,7 +873,7 @@ impl BuildScript {
 
         // 自定义命令：第一遍只收集 outputs（含父脚本继承的），
         // 第二遍解析 depends/命令（这样 depends 可以引用任意顺序声明的产物）。
-        let mut custom_outputs: BTreeSet<PathBuf> = inherited_customs.clone();
+        let mut custom_outputs: BTreeSet<PathBuf> = ctx.inherited_customs.clone();
         let mut seen_custom: BTreeSet<String> = BTreeSet::new();
         let mut resolved_names: Vec<String> = Vec::with_capacity(self.custom_commands.len());
         for (i, cc) in self.custom_commands.iter().enumerate() {
@@ -846,12 +1006,25 @@ impl BuildScript {
 
         // include 子脚本：先于本文件的 targets 合并（路径相对子脚本目录），
         // 子脚本的自定义命令产物也并入存在性检查集合。
+        // 所有声明过的 target 名（含被过滤掉的）：依赖校验用（声明-但-过滤 = 合法）。
+        let mut declared: BTreeSet<String> =
+            self.targets.iter().map(|t| t.name.clone()).collect();
         let mut targets: Vec<ResolvedTarget> = Vec::new();
         for inc in &self.includes {
             let inc_path = dir.join(inc);
             let (sub_script, sub_dir) = load(&inc_path)?;
-            let sub_resolved =
-                sub_script.resolve_impl(&sub_dir, overrides, cli_profile, &custom_outputs)?;
+            let sub_ctx = ResolveInherit {
+                overrides: ctx.overrides,
+                cli_profile: ctx.cli_profile,
+                inherited_customs: &custom_outputs,
+                inherited_out: Some(&out_dir),
+                inherited_cache: Some(&cache_dir),
+                inherited_vars: &vars,
+            };
+            let sub_resolved = sub_script.resolve_impl(&sub_dir, &sub_ctx, visited)?;
+            for name in &sub_resolved.declared {
+                declared.insert(name.clone());
+            }
             for cc in sub_resolved.custom_commands {
                 if !seen_custom.insert(cc.name.clone()) {
                     return Err(format!("custom_commands 名重复: '{}'", cc.name));
@@ -865,24 +1038,26 @@ impl BuildScript {
         }
 
         // INTERFACE 头文件库：依赖者使用要求由 propagate_usage 全局传递。
-        let ctx = ResolveContext {
+        let target_ctx = ResolveContext {
             dir: &dir,
             out_dir: &out_dir,
             host: &host,
             vars: &vars,
-            cli_profile,
+            cli_profile: ctx.cli_profile,
             custom_outputs: &custom_outputs,
             import_includes: &import_includes,
             import_defines: &import_defines,
             import_link: &import_link,
         };
         for t in &self.targets {
-            if let Some(r) = self.resolve_target(t, &ctx)? {
+            if let Some(r) = self.resolve_target(t, &target_ctx)? {
                 targets.push(r);
             }
         }
         // 依赖目标的公开使用要求（include / defines / link）向下游传递。
-        propagate_usage(&mut targets)?;
+        // 根脚本严格校验依赖；子脚本解析宽松（跨分支依赖由根脚本统一处理）。
+        // declared：所有声明过的 target 名（含被过滤的）用于区分"未声明"（错）与"声明但被条件过滤"（合法）。
+        let export_sets = propagate_usage(&mut targets, is_root, &declared)?;
         Ok(ResolvedScript {
             script: self.clone(),
             dir,
@@ -892,6 +1067,8 @@ impl BuildScript {
             custom_commands,
             parallel,
             host,
+            declared: declared.into_iter().collect(),
+            export_sets,
         })
     }
 
@@ -1077,9 +1254,10 @@ impl BuildScript {
             flags.push(format!("--sysroot={sr}"));
         }
         flags.extend(t.flags.iter().map(|f| sub(f)));
-        // pkg-config 的编译参数（-I/-D/-pthread 等）。
+        // pkg-config 的编译参数（-I/-D/-pthread 等）；静态同样的 --cflags。
         let pkg_config: Vec<String> = t.pkg_config.iter().map(|p| sub(p)).collect();
-        for pkg in &pkg_config {
+        let pkg_config_static: Vec<String> = t.pkg_config_static.iter().map(|p| sub(p)).collect();
+        for pkg in pkg_config.iter().chain(pkg_config_static.iter()) {
             flags.extend(pkg_config_flags(pkg, "--cflags"));
         }
 
@@ -1110,11 +1288,19 @@ impl BuildScript {
         let mut link_flags = vec![];
         link_flags.extend(toolchain_link);
         link_flags.extend(t.link_flags.iter().map(|f| sub(f)));
-        let link_dirs: Vec<PathBuf> = t
+        // link_dirs：defaults 在前（全局搜索路径），target 在后，去重保序。
+        let mut link_dirs: Vec<PathBuf> = self
+            .defaults
             .link_dirs
             .iter()
             .map(|s| dir.join(sub(s)))
             .collect();
+        for s in &t.link_dirs {
+            let p = dir.join(sub(s));
+            if !link_dirs.contains(&p) {
+                link_dirs.push(p);
+            }
+        }
 
         let profile = t
             .profile
@@ -1123,13 +1309,23 @@ impl BuildScript {
             .unwrap_or_default();
         let strip = t.strip.unwrap_or(self.defaults.strip);
         // rpath：$ORIGIN 模板/绝对路径原样保留；其余相对路径相对脚本目录解析。
+        // macOS/iOS 的加载器不认 $ORIGIN（它是 GNU 扩展），翻译为 @loader_path。
+        let translate_origin = |s: &str| -> String {
+            if matches!(target_host.os, Os::Macos | Os::Ios) {
+                s.replace("$ORIGIN", "@loader_path")
+                    .replace("${ORIGIN}", "@loader_path")
+            } else {
+                s.to_string()
+            }
+        };
         let rpath: Vec<String> = t
             .rpath
             .iter()
             .map(|s| sub(s))
             .map(|s| {
+                let s = translate_origin(&s);
                 let p = Path::new(&s);
-                if p.is_absolute() || s.contains("$ORIGIN") || s.contains("${ORIGIN}") {
+                if p.is_absolute() || s.contains("$ORIGIN") || s.contains("${ORIGIN}") || s.contains("@loader_path") {
                     s
                 } else {
                     dir.join(&s).to_string_lossy().into_owned()
@@ -1148,6 +1344,11 @@ impl BuildScript {
                 .filter(|v| !v.trim().is_empty())
                 .filter(|_| !target_host.os.is_windows_family());
             match t.kind {
+                // Java: 真实产物是 classes 目录（javac -d <out>/classes）；
+                // 使 output 非空且存在，缓存/find_exe 才能工作。
+                TargetKind::Exe if matches!(language, Language::Java) => {
+                    "classes".to_string()
+                }
                 TargetKind::Exe
                     if !matches!(language, Language::Python | Language::Shell | Language::Java) =>
                 {
@@ -1197,6 +1398,7 @@ impl BuildScript {
             deps: t.deps.clone(),
             private_deps: t.private_deps.clone(),
             output: out_dir.join(output),
+            alias: t.alias.clone(),
             groups: t.groups,
             group_size: t.group_size,
             parallel: t.parallel.unwrap_or(true),
@@ -1211,10 +1413,12 @@ impl BuildScript {
                 .filter(|v| !v.is_empty()),
             warnings: self.defaults.warnings,
             werror: t.werror.unwrap_or(self.defaults.werror),
+            lto: t.lto.unwrap_or(self.defaults.lto),
             install: t.install.unwrap_or(true),
             c_std: t.c_std.clone(),
             cxx_std: t.cxx_std.clone(),
             pkg_config,
+            pkg_config_static,
             when: t.when.clone(),
             pch: t
                 .pch
@@ -1265,18 +1469,19 @@ fn pkg_config_flags(pkg: &str, flag: &str) -> Vec<String> {
 /// 目标的公开导出集：向下游（包括经由 public deps）重导出的使用要求。
 /// 目标本身声明的是 public 的；private_deps 的导出集只并入**本级编译**，
 /// 不再向下游重导出（CMake PRIVATE 语义）。
-#[derive(Clone, PartialEq)]
-struct ExportSet {
-    include_dirs: Vec<PathBuf>,
-    defines: Vec<String>,
-    link: Vec<String>,
-    link_dirs: Vec<PathBuf>,
-    link_flags: Vec<String>,
-    pkg_config: Vec<String>,
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct ExportSet {
+    pub include_dirs: Vec<PathBuf>,
+    pub defines: Vec<String>,
+    pub link: Vec<String>,
+    pub link_dirs: Vec<PathBuf>,
+    pub link_flags: Vec<String>,
+    pub pkg_config: Vec<String>,
+    pub pkg_config_static: Vec<String>,
 }
 
 impl ExportSet {
-    fn of(t: &ResolvedTarget) -> Self {
+    pub(crate) fn of(t: &ResolvedTarget) -> Self {
         Self {
             include_dirs: t.include_dirs.clone(),
             defines: t.defines.clone(),
@@ -1284,11 +1489,12 @@ impl ExportSet {
             link_dirs: t.link_dirs.clone(),
             link_flags: t.link_flags.clone(),
             pkg_config: t.pkg_config.clone(),
+            pkg_config_static: t.pkg_config_static.clone(),
         }
     }
 
     /// 并入 `src`，返回是否有变化。
-    fn merge(&mut self, src: &ExportSet) -> bool {
+    pub(crate) fn merge(&mut self, src: &ExportSet) -> bool {
         let mut changed = false;
         changed |= merge_unique(&mut self.include_dirs, &src.include_dirs);
         changed |= merge_unique(&mut self.defines, &src.defines);
@@ -1296,25 +1502,111 @@ impl ExportSet {
         changed |= merge_unique(&mut self.link_dirs, &src.link_dirs);
         changed |= merge_unique(&mut self.link_flags, &src.link_flags);
         changed |= merge_unique(&mut self.pkg_config, &src.pkg_config);
+        changed |= merge_unique(&mut self.pkg_config_static, &src.pkg_config_static);
         changed
     }
 }
 
+/// 解析 alias → 最终目标名（递归）。循环/悬空由 `validate_aliases` 报错；
+/// 这里优雅收敛（跳出最多 n+1 跳）。给依赖解析/过滤/链接共用。
+pub fn unalias(name: &str, targets: &[ResolvedTarget]) -> String {
+    let map: BTreeMap<&str, &ResolvedTarget> = targets.iter().map(|t| (t.name.as_str(), t)).collect();
+    let mut cur = name.to_string();
+    for _ in 0..map.len().max(1) + 1 {
+        match map.get(cur.as_str()) {
+            Some(t) if t.kind == TargetKind::Alias => match &t.alias {
+                Some(inner) => cur = inner.clone(),
+                None => break,
+            },
+            _ => return cur,
+        }
+    }
+    cur
+}
+
+/// 校验所有 alias 目标：`alias` 必填、指向存在、无环；
+/// 以及 `alias` 字段只允许出现在 alias 目标上。
+pub(crate) fn validate_aliases(targets: &[ResolvedTarget]) -> Result<(), String> {
+    let by_name: BTreeMap<&str, &ResolvedTarget> = targets.iter().map(|t| (t.name.as_str(), t)).collect();
+    for t in targets {
+        if t.kind == TargetKind::Alias {
+            let Some(a) = &t.alias else {
+                return Err(format!(
+                    "alias 目标 '{}'：缺少 alias = \"<name>\"",
+                    t.name
+                ));
+            };
+            if a == &t.name {
+                return Err(format!("alias 目标 '{}' 依赖自身", t.name));
+            }
+            // 链走查 + 环检测。
+            let mut seen = BTreeSet::new();
+            let mut cur = a.as_str();
+            loop {
+                if !seen.insert(cur) {
+                    return Err(format!("alias 目标 '{}' 存在环: '{}'", t.name, cur));
+                }
+                match by_name.get(cur) {
+                    Some(target) if target.kind == TargetKind::Alias => {
+                        cur = target.alias.as_deref().unwrap_or("");
+                    }
+                    Some(_) => break,
+                    None => {
+                        return Err(format!(
+                            "alias 目标 '{}' 指向不存在的 target '{}'",
+                            t.name, cur
+                        ))
+                    }
+                }
+            }
+        } else if t.alias.is_some() {
+            return Err(format!(
+                "target '{}'：只有 kind = \"alias\" 可设置 alias 字段",
+                t.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 传递依赖目标的公开使用要求（include_dirs / defines / link / link_dirs / link_flags / pkg_config）。
 /// `deps` 重导出（PUBLIC），`private_deps` 仅提供给本级编译与链接，不外传。
-fn propagate_usage(targets: &mut [ResolvedTarget]) -> Result<(), String> {
+/// `strict = false`（include 子脚本）：跨分支依赖（diamond 场景在别的分支已被解析）
+/// 静默跳过，等最终在根脚本统一校验；`strict = true`（根脚本）：缺依赖直接报错。
+fn propagate_usage(
+    targets: &mut [ResolvedTarget],
+    strict: bool,
+    declared: &BTreeSet<String>,
+) -> Result<Vec<ExportSet>, String> {
+    // 校验 alias（递归最终指向 + 环检测 + 字段归属）。
+    validate_aliases(targets)?;
+
     let mut index: BTreeMap<String, usize> = BTreeMap::new();
     for (i, t) in targets.iter().enumerate() {
         if index.insert(t.name.clone(), i).is_some() {
             return Err(format!("target 名重复: '{}'", t.name));
         }
     }
+    // 预计算所有 target 名 → 最终 unalias 名。
+    let unaliases: BTreeMap<String, String> = targets
+        .iter()
+        .map(|t| (t.name.clone(), unalias(&t.name, targets)))
+        .collect();
+    let unalias_of = |dep: &str| -> String {
+        unaliases.get(dep).cloned().unwrap_or_else(|| dep.to_string())
+    };
     let kinds: Vec<TargetKind> = targets.iter().map(|t| t.kind).collect();
+    // 注意：依赖解析全部经 unalias_of/kinds（alias → 最终目标）。
+
     // 依赖存在性/自指校验（public 与 private 都检查）。
     for t in targets.iter() {
         for dep in t.deps.iter().chain(t.private_deps.iter()) {
-            if !index.contains_key(dep) {
-                return Err(format!("target '{}' 依赖不存在的 target '{}'", t.name, dep));
+            if !index.contains_key(&unalias_of(dep)) {
+                // 声明过但被平台/when 过滤的 target：视为合法的条件依赖，静默跳过。
+                if strict && !declared.contains(&unalias_of(dep)) {
+                    return Err(format!("target '{}' 依赖不存在的 target '{}'", t.name, dep));
+                }
+                continue;
             }
             if dep == &t.name {
                 return Err(format!("target '{}' 依赖自身", t.name));
@@ -1335,11 +1627,14 @@ fn propagate_usage(targets: &mut [ResolvedTarget]) -> Result<(), String> {
             // - 其导出集并入本级编译集；
             // - 其导出集也并入本级导出集（向下游重导出）。
             for dep in &target.deps {
-                let &j = index.get(dep).expect("dep 存在性已校验");
+                let ud = unalias_of(dep);
+                let Some(&j) = index.get(&ud) else {
+                    continue; // lenient：跨分支依赖，根脚本统一处理
+                };
                 if j == i {
                     continue;
                 }
-                if matches!(kinds[j], TargetKind::Exe | TargetKind::Phony) {
+                if matches!(kinds[j], TargetKind::Exe | TargetKind::Phony | TargetKind::Alias) {
                     continue;
                 }
                 changed |= merge_unique(&mut target.include_dirs, &snapshot[j].include_dirs);
@@ -1352,11 +1647,14 @@ fn propagate_usage(targets: &mut [ResolvedTarget]) -> Result<(), String> {
             }
             // private 依赖（private_deps）：只并入本级编译集，不进导出集。
             for dep in &target.private_deps {
-                let &j = index.get(dep).expect("private_dep 存在性已校验");
+                let ud = unalias_of(dep);
+                let Some(&j) = index.get(&ud) else {
+                    continue;
+                };
                 if j == i {
                     continue;
                 }
-                if matches!(kinds[j], TargetKind::Exe | TargetKind::Phony) {
+                if matches!(kinds[j], TargetKind::Exe | TargetKind::Phony | TargetKind::Alias) {
                     continue;
                 }
                 changed |= merge_unique(&mut target.include_dirs, &snapshot[j].include_dirs);
@@ -1375,7 +1673,7 @@ fn propagate_usage(targets: &mut [ResolvedTarget]) -> Result<(), String> {
             break;
         }
     }
-    Ok(())
+    Ok(exports)
 }
 
 fn merge_unique<T: PartialEq + Clone>(dst: &mut Vec<T>, src: &[T]) -> bool {

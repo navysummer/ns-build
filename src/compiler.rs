@@ -104,6 +104,10 @@ impl<'a> CompileContext<'a> {
         if t.werror {
             cmd.push("-Werror".into());
         }
+        // 链接时优化：需同时用于编译与链接。
+        if t.lto {
+            cmd.push("-flto".into());
+        }
         // 宏定义。
         for d in &t.defines {
             cmd.push(format!("-D{d}"));
@@ -186,6 +190,9 @@ fn compile_command_msvc(ctx: &CompileContext<'_>, src: &Path, out: &Path) -> Vec
     if t.werror {
         cmd.push("/WX".into());
     }
+    if t.lto {
+        cmd.push("/GL".into());
+    }
     // 宏定义。
     for d in &t.defines {
         cmd.push(format!("/D{d}"));
@@ -250,8 +257,8 @@ pub fn link_command(
     out: &Path,
     host: Host,
     profile: Profile,
+    is_cpp: bool,
 ) -> Vec<String> {
-    let is_cpp = matches!(target.language, crate::script::Language::Cpp);
     let linker = if is_cpp { target.cxx.clone() } else { target.cc.clone() };
     if is_msvc_compiler(&linker) {
         return link_command_msvc(target, objs, out, profile);
@@ -260,6 +267,9 @@ pub fn link_command(
 
     for f in profile.opt_flags() {
         cmd.push(f.to_string());
+    }
+    if target.lto {
+        cmd.push("-flto".into());
     }
     // 库搜索目录。
     for d in &target.link_dirs {
@@ -317,6 +327,7 @@ pub fn link_command(
         }
     }
     // pkg-config 包：展开 `pkg-config --libs <pkg>`。
+    // 与文档一致：查询失败按"无该依赖"处理（不展开），而非回退为不存在的 `-l<pkg>`。
     for pkg in &target.pkg_config {
         let out = std::process::Command::new("pkg-config")
             .args(["--libs", pkg])
@@ -326,8 +337,20 @@ pub fn link_command(
                 let s = String::from_utf8_lossy(&o.stdout);
                 cmd.extend(s.split_whitespace().map(|s| s.to_string()));
             }
-            // 找不到包或运行失败：回退为 `-l<pkg>`，不阻塞构建。
-            _ => cmd.push(format!("-l{pkg}")),
+            _ => {}
+        }
+    }
+    // pkg-config 静态包：展开 `pkg-config --libs --static <pkg>`（含 Libs.private 闭包）。
+    for pkg in &target.pkg_config_static {
+        let out = std::process::Command::new("pkg-config")
+            .args(["--libs", "--static", pkg])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                cmd.extend(s.split_whitespace().map(|s| s.to_string()));
+            }
+            _ => {}
         }
     }
     if target.strip {
@@ -391,6 +414,9 @@ fn link_command_msvc(
     if matches!(profile, Profile::Debug | Profile::RelWithDebInfo) {
         cmd.push("/DEBUG".into());
     }
+    if target.lto {
+        cmd.push("/LTCG".into());
+    }
     for d in &target.link_dirs {
         cmd.push(format!("/LIBPATH:{}", d.display()));
     }
@@ -432,6 +458,7 @@ pub fn make_link_task(
     host: Host,
     profile: Profile,
     ar: &str,
+    is_cpp: bool,
 ) -> CompileTask {
     use crate::script::{Language, TargetKind};
 
@@ -449,7 +476,7 @@ pub fn make_link_task(
                 let probe = if is_cpp_target { &target.cxx } else { &target.cc };
                 archive_command(ar, &inputs, &target.output, is_msvc_compiler(probe))
             }
-            _ => link_command(target, &inputs, &target.output, host, profile),
+            _ => link_command(target, &inputs, &target.output, host, profile, is_cpp),
         },
     };
     CompileTask {
@@ -609,6 +636,7 @@ mod tests {
             deps: vec![],
             private_deps: vec![],
             output: PathBuf::from(format!("out/{name}")),
+            alias: None,
             groups: None,
             group_size: None,
             parallel: true,
@@ -617,6 +645,7 @@ mod tests {
             strip: false,
             warnings: true,
             werror: false,
+            lto: false,
             rpath: vec![],
             soversion: None,
             install: true,
@@ -624,6 +653,7 @@ mod tests {
             c_std: None,
             cxx_std: None,
             pkg_config: vec![],
+            pkg_config_static: vec![],
             when: None,
             pch: vec![],
         }
@@ -652,7 +682,7 @@ mod tests {
     #[test]
     fn link_exe_uses_o_flag() {
         let t = target("a", TargetKind::Exe);
-        let cmd = link_command(&t, &[PathBuf::from("a.o")], &t.output, Host::current(), Profile::Release);
+        let cmd = link_command(&t, &[PathBuf::from("a.o")], &t.output, Host::current(), Profile::Release, false);
         assert_eq!(cmd[0], "cc");
         assert!(cmd.contains(&"a.o".to_string()));
         assert!(cmd.contains(&"-o".to_string()));
@@ -681,10 +711,61 @@ mod tests {
             &[PathBuf::from("a.o")],
             &PathBuf::from("a"),
             Host::current(),
-            Profile::Release,
+            Profile::Release, false
         );
         assert!(cmd.contains(&"-Wl,-rpath,/opt/lib".to_string()));
         assert!(cmd.contains(&"-Wl,-rpath,$ORIGIN/../lib".to_string()));
+    }
+
+    #[test]
+    fn lto_adds_flags_both_compile_and_link() {
+        let mut t = target("a", TargetKind::Exe);
+        t.lto = true;
+        let cmd = compile_command(
+            &CompileContext {
+                cc: "cc",
+                target: &t,
+                profile: Profile::Release,
+                is_cxx: false,
+            },
+            Path::new("a.c"),
+            Path::new("a.o"),
+            Path::new("a.d"),
+        );
+        assert!(cmd.contains(&"-flto".to_string()));
+        let link = link_command(
+            &t,
+            &[PathBuf::from("a.o")],
+            &PathBuf::from("a"),
+            Host::current(),
+            Profile::Release, false
+        );
+        assert!(link.contains(&"-flto".to_string()));
+        // MSVC 风格
+        let mut t2 = target("a", TargetKind::Exe);
+        t2.cc = "cl".into();
+        t2.cxx = "cl".into();
+        t2.lto = true;
+        let cl = compile_command(
+            &CompileContext {
+                cc: "cl",
+                target: &t2,
+                profile: Profile::Release,
+                is_cxx: false,
+            },
+            Path::new("a.c"),
+            Path::new("a.obj"),
+            Path::new("a.d"),
+        );
+        assert!(cl.contains(&"/GL".to_string()));
+        let link2 = link_command(
+            &t2,
+            &[PathBuf::from("a.obj")],
+            &PathBuf::from("app.exe"),
+            Host::current(),
+            Profile::Release, false
+        );
+        assert!(link2.contains(&"/LTCG".to_string()));
     }
 
     #[test]
@@ -876,7 +957,7 @@ mod tests {
             &[PathBuf::from("a.obj")],
             &PathBuf::from("app.exe"),
             Host::current(),
-            Profile::Debug,
+            Profile::Debug, false
         );
         assert_eq!(cmd[0], "link");
         assert!(cmd.contains(&"/nologo".to_string()));
@@ -893,7 +974,7 @@ mod tests {
             &[PathBuf::from("a.obj")],
             &PathBuf::from("a.dll"),
             Host::current(),
-            Profile::Release,
+            Profile::Release, false
         );
         assert!(dll.contains(&"/DLL".to_string()));
     }

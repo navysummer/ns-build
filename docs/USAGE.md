@@ -8,14 +8,16 @@
 |------|------|
 | `ns-build build [目标...]` | 构建（默认所有目标；指定则只构建这些） |
 | `ns-build clean` | 删除 `build/` 与缓存 |
-| `ns-build test [--all] [--label L] [-j N]` | 构建并运行测试（`--label` 只跑带该标签的 `[[tests]]`，可重复） |
-| `ns-build install [--prefix P]` | 安装到前缀（默认 `/usr/local`；`[[exports]]` 的配置文件一并写入） |
-| `ns-build package [--format tar.gz\|zip]` | install 到 staging 并打包为归档（默认 `dist/<name>-<version>.tar.gz`） |
+| `ns-build test [--all] [--label L] [-j N]` | 构建并运行测试（`--label` 只跑带该标签的 `[[tests]]`，可重复；`-j N` 并行运行，输出仍按声明顺序打印） |
+| `ns-build install [--prefix P] [--strip]` | 安装到前缀（默认 `/usr/local`；`--strip` strip 安装副本；`[[exports]]` 的配置文件一并写入） |
+| `ns-build package [--format tar.gz\|zip] [--strip]` | install 到 staging 并打包为归档（`--strip`：打包的二进制被 strip；默认 `dist/<name>-<version>.tar.gz`） |
+| `ns-build uninstall [--prefix P] [--name N]` | 按安装清单删除已安装文件（默认包名取当前项目；`--name` 覆盖） |
 | `ns-build run <目标> [-- 参数...]` | 构建并运行目标 |
-| `ns-build show` | 列出目标 |
+| `ns-build show [--json]` | 列出目标（`--json`：机器可读 JSON：targets/sources/deps/output/parallel 等） |
 | `ns-build graph` | 打印依赖图 |
 | `ns-build presets` | 列出 `[presets]` 中的预设 |
 | `ns-build fetch [--update]` | 拉取 `[[fetch]]` 外部依赖到 `.ns-fetch/` |
+| `ns-build doctor` | 环境自检：外部工具是否可用及其版本 |
 | `ns-build init [--name N]` | 生成初始 `ns-build.toml` |
 | `ns-build --version` / `-V` | 版本 |
 | `ns-build --help` / `-h` | 帮助 |
@@ -36,7 +38,7 @@
 
 TOML 声明式。顶层节：
 
-- `[project]`：`name`、`version`、`root`（源码根，相对脚本；默认 `.`）、`out`（产物目录，默认 `build`）
+- `[project]`：`name`、`version`、`root`（源码根，相对脚本；默认 `.`）、`out`（产物目录，默认 `build`）、`description` / `license`（可选，进导出 `.pc` 的 `Description`）
 - `[defaults]`：全局编译设置（见下）
 - `[[targets]]`：目标定义
 - `[[toolchains]]`：交叉编译工具链
@@ -48,6 +50,7 @@ TOML 声明式。顶层节：
 - `[[install_files]]`：通用文件/目录安装规则
 - `[[tests]]`：显式测试注册
 - `[[checks]]`：编译器特性检测（`check_cxx_compiler_flag`）
+- `[install]`：安装目录名（`bindir` / `libdir` / `includedir`）
 - `[presets]`：命名构建预设（`--preset`）
 - `includes = [...]`：子脚本（目录或 `ns-build.toml` 文件路径）
 
@@ -57,6 +60,7 @@ TOML 声明式。顶层节：
 |------|------|------|
 | `cc` / `cxx` / `ar` | 编译器 | `cc` / `c++` / `ar` |
 | `flags` / `cflags` / `cxxflags` | 编译标志 | `[]` |
+| `link_dirs` | 链接库搜索目录（target 可叠加，`-L`） | `[]` |
 | `link_flags` | 链接标志 | `[]` |
 | `include_dirs` | 头文件目录 | `[]` |
 | `defines` | 宏定义 | `[]` |
@@ -75,7 +79,7 @@ TOML 声明式。顶层节：
 | 字段 | 说明 |
 |------|------|
 | `name` | 目标名（必填） |
-| `kind` | `exe` / `lib`（动态库）/ `module`（dlopen 模块）/ `static`（.a）/ `object` / `interface`（头文件库）/ `phony`（聚合） |
+| `kind` | `exe` / `lib`（动态库）/ `module`（dlopen 模块）/ `static`（.a）/ `object` / `interface`（头文件库）/ `phony`（聚合）/ `alias`（别名） |
 | `language` | `c` / `c++`（`cpp` 亦可）/ `rust` / `go` / `java` / `zig` / `python` / `shell`。未指定时按源文件后缀推断 C/C++ |
 | `cc` | 编译器覆盖（覆盖默认与工具链） |
 | `toolchain` | 指定 `[[toolchains]]` 名（覆盖 `defaults.toolchain`）；决定目标平台 os/arch |
@@ -97,12 +101,16 @@ TOML 声明式。顶层节：
 | `strip` | 目标级剥离 |
 | `werror` | 目标级警告即错误（覆盖 `defaults.werror`） |
 | `soversion` | 动态库版本（如 `"1"`）：输出 `libfoo.so.1` / `libfoo.1.dylib`，并创建开发者符号链接 `libfoo.so` / `libfoo.dylib`（soname / install_name） |
-| `rpath` | 链接时写入的运行时库搜索路径（`-Wl,-rpath`）；支持 `$ORIGIN`（`$ORIGIN/../lib` 可让安装后的二进制找到 `prefix/lib`）与相对路径（相对脚本目录解析）；Windows 忽略 |
+| `rpath` | 链接时写入的运行时库搜索路径（`-Wl,-rpath`）；支持 `$ORIGIN`（`$ORIGIN/../lib` 可让安装后的二进制找到 `prefix/lib`；macOS 自动翻译为 `@loader_path`）与相对路径（相对脚本目录解析）；Windows 忽略 |
 | `install` | 是否安装（默认 `true`） |
 | `when` | 条件表达式（`os == "linux" && arch == "x86_64"`，支持 `!`/括号） |
 | `c_std` / `cxx_std` | 编译标准（`c11` / `gnu11` / `c++17` / `c++20`） |
 | `pkg_config` | pkg-config 包名（编译展开 `--cflags`，链接展开 `--libs`） |
+| `pkg_config_static` | pkg-config 静态包（链接展开 `--libs --static`，含 `Libs.private` 闭包依赖） |
 | `pch` | 预编译头：`pch = "stdafx.h"` 或 `["a.h", "b.h"]`（`-include` / `/FI`） |
+| `alias` | 别名目标：`kind = "alias"` 且 `alias = "<name>"`，零开销指向另一个 target（CMake ALIAS） |
+| `lto` | 链接时优化：`lto = true` → `-flto` / `/GL` + `/LTCG`（target 或 defaults） |
+| `werror` | 警告即错误（见 `[defaults]`） |
 
 ### `[[toolchains]]`
 
@@ -187,6 +195,10 @@ when = 'os == "linux" && arch == "x86_64"'
 includes = ["sub"]      # sub/ns-build.toml，或直接 "sub/ns-build.toml"
 ```
 
+**菱形引用去重**：同一子脚本被多个分支引用（A include B 和 C，B 和 C 都 include D）时，D 只解析一次（CMake `include_guard(GLOBAL)` 对等）。
+**环检测**：A include B，B include A 不会无限递归——已访问的脚本静默跳过。
+依赖传播是**全局**的：include 各分支合并后，`deps` 的使用要求统一传播给合并后的全体目标（含跨分支依赖）。
+
 ### 依赖使用要求的传播
 
 依赖目标（`deps`）声明的 `include_dirs`、`defines`、`link`、`link_dirs`、`link_flags`、`pkg_config` 会**传递性传播**给依赖者（可执行文件与别名除外——它们不可链接）。`INTERFACE` 头文件库只传递 `include_dirs`/`defines`，自身无产物。**`private_deps`** 与 `deps` 参与编译与链接，但其使用要求**不会**向下游重导出（CMake PRIVATE 语义）：
@@ -203,6 +215,19 @@ private_deps = ["implib"]   # 仅 app 自己链接/编译需要，不外传
 - `object` 依赖 → 对象并入链接输入（静态库归档也是）
 - `static`/`lib`/`module` 依赖 → 其产物直接链接；静态库链式依赖会递归收集，无需在最终 target 重复声明
 - 链接构建树内的动态库时会自动加 `-Wl,-rpath`，未安装也可直接运行
+
+### alias 目标
+
+`kind = "alias"` 的目标没有产物、没有源文件，`alias = "<name>"` 指向另一个目标（可链式指向 alias，环会被报错）。任何出现别名的地方（依赖、过滤、安装、导出）都等价于底层目标：
+
+```toml
+[[targets]]
+name = "mylib-cxx23"
+kind = "alias"
+alias = "mylib"     # 所有对 mylib-cxx23 的引用 ≡ 引用 mylib
+```
+
+`ns-build build mylib-cxx23` 等价于 `ns-build build mylib`。
 
 ### unity build
 
@@ -279,7 +304,18 @@ pc = true                      # 同时生成 lib/pkgconfig/<name>.pc（relocata
 [[imports]]
 from = "/usr/local"            # 前缀目录 / 配置文件路径 / 含 <name>-config.toml 的目录
 name = "mylib"
+version = ">=1.2.0"            # 可选：版本约束，不满足报错（= / > / < / >= / <= / !=；裸版本号等价 =）
 ```
+
+安装布局：`[install]` 节可改 `bindir`（默认 `bin`）/ `libdir`（默认 `lib`）/ `includedir`（默认 `include`）：
+
+```toml
+[install]
+libdir = "lib64"               # 如发行版用 lib64
+includedir = "include64"
+```
+
+`install` / `package` / `uninstall` / 导出的 `.pc` / 符号链接全部跟随。`uninstall` 从 `share/ns-build/<pkg>.manifest` 读清单删除。
 
 ### `ns-build package`
 
@@ -308,6 +344,7 @@ rev = "10.2.1"                     # tag / 分支 / 提交（默认远程 HEAD�
 name = "zlib"
 url = "https://zlib.net/zlib-1.3.1.tar.gz"
 strip_components = 1               # 解压去掉的前缀层数（仅 tar）
+sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df"   # 可选：校验，不匹配报错
 ```
 
 ```bash
@@ -413,4 +450,4 @@ dist = { profile = "release", jobs = 8 }
 
 ## 编译命令
 
-构建时生成 `build/compile_commands.json`（CMake 兼容，供 clangd / IDE 使用）。
+构建时生成 `build/compile_commands.json`（CMake 兼容；每条记录同时含 `arguments`（数组，含空格参数不断）与 `command`（字符串），供 clangd / IDE 使用）。

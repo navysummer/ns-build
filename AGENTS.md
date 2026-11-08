@@ -18,6 +18,8 @@
 - **构建预设**：`[presets]` + `--preset`（`cmake --preset`）；**外部依赖**：`[[fetch]]` + `ns-build fetch`（`FetchContent`）。
 - **依赖粒度**：`private_deps` 参与编译/链接但不重导出（CMake PRIVATE）；**特性检测**：`[[checks]]` try-compile 缓存注入变量（`check_cxx_compiler_flag`）。
 - **库版本**：`soversion`（soname/install_name + 开发者符号链接）；**打包**：`ns-build package`（`.tar.gz`/`.zip`）。
+- **别名**：`kind = "alias"`（`alias = "x"`）全链路等价于底层目标；**LTO**：`lto = true`（`-flto` / `/GL`+`/LTCG`）；**并行测试**：`test -j N`；**环境自检**：`ns-build doctor`；**卸载**：`ns-build uninstall`（安装清单）。
+- **依赖完整性**：`[[fetch]] sha256` 校验（URL_HASH 对等）；**静态闭包**：`pkg_config_static`（`--libs --static`）；**自定义安装目录**：`[install] bindir/libdir/includedir`；**导入版本约束**：`[[imports]] version`。
 
 ## 构建脚本（`ns-build.toml`）格式
 
@@ -49,7 +51,7 @@ cache = ".ns-cache"   # 增量缓存目录
 
 [[targets]]
 name = "app"
-kind = "exe"          # exe | lib | static | object | module | interface | phony
+kind = "exe"          # exe | lib | static | object | module | interface | phony | alias
 cc = "gcc"            # 覆盖 defaults.cc（覆盖工具链）
 toolchain = "mingw"   # 可选：指定 [[toolchains]]（覆盖 defaults.toolchain）
 sources = ["src/**/*.c"]   # 支持 glob，相对 project.root
@@ -101,6 +103,9 @@ depends = ["template.txt"]
 
 [presets]              # 命名预设（cmake --preset）
 dist = { profile = "release", jobs = 8 }
+
+[install]              # 安装目录名（bindir/libdir/includedir）
+libdir = "lib64"
 ```
 
 ### Target 种类
@@ -127,7 +132,11 @@ ns-build show
 ns-build graph        # 输出 DOT 依赖图
 ns-build presets      # 列出 [presets] 预设
 ns-build fetch [--update]  # 拉取 [[fetch]] 外部依赖
-ns-build package [--format tar.gz|zip]  # install 到 staging 并打包
+ns-build package [--format tar.gz|zip] [--strip]  # install 到 staging 并打包
+ns-build doctor       # 环境自检（外部工具可用性 + 版本）
+ns-build uninstall [--prefix P] [--name N]  # 按安装清单卸载（install 时写 share/ns-build/<pkg>.manifest）
+ns-build show [--json]  # 目标列表（--json：机器可读）
+ns-build install [--strip]  # 安装（--strip：剥离安装副本）
 ns-build init [--name <名>]
 ```
 
@@ -154,7 +163,7 @@ src/
 ### 数据流
 
 1. `load(dir)` → 读 `ns-build.toml`，`BuildScript::parse` 反序列化。
-2. `BuildScript::resolve(dir)` → `ResolvedScript`：imports 合并 → `[[checks]]` try-compile（磁盘缓存注入 `${var}` 与全局 -D）→ 自定义命令两遍解析（先收集 outputs 再解析 depends/command）→ include 子脚本合并（父级 outputs 作为继承存在性检查）→ targets 解析（glob 展开、平台过滤）；依赖使用要求由 propagate_usage 全局传播（`deps` PUBLIC 重导出 / `private_deps` 仅本级）。
+2. `BuildScript::resolve(dir)` → `ResolvedScript`：imports 合并 → `[[checks]]` try-compile（磁盘缓存注入 `${var}` 与全局 -D）→ 自定义命令两遍解析（先收集 outputs 再解析 depends/command）→ include 子脚本合并（菱形引用 `visited` 去重 + 环检测，`include_guard(GLOBAL)` 对等；父级 outputs 作为继承存在性检查）→ targets 解析（glob 展开、平台过滤）；依赖使用要求由 propagate_usage 全局传播（`deps` PUBLIC 重导出 / `private_deps` 仅本级；子脚本解析宽松、根脚本严格）。
 3. `planner::plan(script, cache)` → `Plan { graph, outputs, skipped }`：
    - 第零遍：`[[custom_commands]]` 生成命令节点（`custom:<name>` 键，缓存按 depends 内容哈希，outputs 全在才缓存命中），再按 `deps` 连成自身 DAG。
    - 第一遍：每个非 phony/interface target 生成对象编译节点（unity 分组）；引用自定义产物的 chunk/源，自动挂依赖边到对应 GEN 节点。
@@ -177,14 +186,14 @@ src/
 ## 测试
 
 ```bash
-cargo test --lib      # 单元测试（58：解析/depfile/缓存/图/调度/编译器/脚本规范化/导出配置/soversion）
-cargo test --test e2e # 端到端（24：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置/init/生成代码/预设/导出导入/fetch/checks/package）
+cargo test --lib      # 单元测试（59：解析/depfile/缓存/图/调度/编译器/脚本规范化/导出配置/检测/LTO）
+cargo test --test e2e # 端到端（43：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置/init/生成代码/预设/导出导入/fetch/sha256/checks/package/alias/doctor/include/strip/json/link_dirs/static/uninstall/自定义布局/审计回归）
 cargo test --test languages # 多语言 e2e（8：含 C++ unity 与 C++ 推断）
 cargo test --test perf # 性能：300 文件全量 vs 增量（增量应显著更快）
 ./scripts/bench.sh    # 与 CMake + Ninja 对比基准（NS_BENCH_N 可调规模）
 ```
 
-**当前全部绿**：58 lib + 3 main(CLI) + 24 e2e + 8 languages + 1 perf = **94 个测试，0 警告 0 错误**（不使用 `#[allow]`/`#[warn]` 等抑制手段；`cargo clippy --all-targets` 亦零警告）。
+**当前全部绿**：60 lib + 3 main(CLI) + 43 e2e + 8 languages + 1 perf = **115 个测试，0 警告 0 错误**（不使用 `#[allow]`/`#[warn]` 等抑制手段；`cargo clippy --all-targets` 亦零警告）。
 
 **性能对比**（300 文件 C 项目，macOS 12 核 clang 17，`scripts/bench.sh`）：
 

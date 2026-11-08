@@ -110,6 +110,9 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 | 测试注册 | `[[tests]]`（含 `timeout`/`labels`，对应 `add_test`） |
 | pkg-config | `pkg_config = ["openssl"]` 展开 `--cflags`（编译）与 `--libs`（链接） |
 | 编译器检测 | `[[checks]]` try-compile+link，结果注入 `${var}` 与 `-D` 宏（对应 `check_cxx_compiler_flag`） |
+| 别名目标 | `kind = "alias"` + `alias = "name"`（对应 `add_library(ALIAS)`，零开销转发） |
+| 环境自检 | `ns-build doctor`（列出外部工具是否可用及其版本） |
+| LTO | `lto = true`（target/defaults → `-flto` / `/GL` + `/LTCG`） |
 | 警告即错误 | `werror`（target/defaults → `-Werror` / `/WX`） |
 | 构建配置 | `--release`/`--debug`/`--profile`（4 种：Release/Debug/RelWithDebInfo/MinSizeRel） |
 | 跨平台 | OS/架构检测，`os`/`arch` 平台过滤 |
@@ -119,15 +122,24 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 | 静态/动态库链接 | `deps` 直接静态/动态库产物并链接；静态库链式依赖自动递归收集（含 private_deps） |
 | 动态库运行 | 链接构建树内 `.so`/`.dylib` 时自动写入 `-Wl,-rpath`；target `rpath` 可嵌入 `$ORIGIN`（安装后可定位 prefix/lib） |
 | 库版本/SONAME | `soversion = "1"` → `libfoo.so.1` / `libfoo.1.dylib` + 开发者符号链接（soname / install_name） |
-| 产物类型 | `exe` / `lib` / `module` / `static` / `object` / `interface` / `phony` |
+| 产物类型 | `exe` / `lib` / `module` / `static` / `object` / `interface` / `phony` / `alias` |
 | 钩子 | `hooks.before`/`hooks.after` 构建前后自定义命令 |
 | 目标过滤 | `ns-build build <target>` 只构建指定目标（含传递依赖） |
 | 生成代码管线 | `[[custom_commands]]`（产物 + 依赖 + 增量，等价 `add_custom_command(OUTPUT)`） |
 | 安装导出 | `[[exports]]` 写入 `<name>-config.toml`（可选 `pc = true` 生成 relocatable `.pc`）；`[[imports]]` 读回并链接（`install(EXPORT)` / `find_package` 等价） |
 | 打包 | `ns-build package`（install → staging → `tar.gz`/`zip`，CPack 简化版） |
+| 卸载 | `ns-build uninstall [--prefix P]`（按 install 清单删除已安装文件） |
+| 依赖完整性 | `[[fetch]]` 的 `sha256`（URL_HASH 对等） |
+| 静态闭包 | `pkg_config_static`（`--libs --static` 展开 `Libs.private`） |
+| 安装目录名 | `[install] bindir`/`libdir`/`includedir`（CMAKE_INSTALL_BINDIR/LIBDIR/INCLUDEDIR 对等） |
+| 导入版本约束 | `[[imports]]` 的 `version`（`>=` / `=` / `<` 半语义比较，对等 find_package 版本 REQUIRED） |
+| 包元数据 | `[project] description` / `license`（进 `.pc` 的 `Description`） |
 | 构建预设 | `[presets]` + `--preset` / `ns-build presets`（对应 `cmake --preset`） |
 | 外部依赖 | `[[fetch]]` + `ns-build fetch`（git / url，`FetchContent` 等价，支持 file:// 离线） |
 | MSVC 工具链 | `cl` / `clang-cl` 命令生成（未在真实 MSVC SDK 本机验证） |
+| 子脚本菱形去重 | include 菱形引用只解析一次 + 环检测（CMake `include_guard(GLOBAL)`） |
+| 机器可读输出 | `ns-build show --json` |
+| 安装瘦身 | `ns-build install --strip` / `package --strip`（strip 安装副本） |
 
 ## 与 CMake 对比
 
@@ -147,21 +159,29 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 | `target_compile_options`（警告） | `warnings = true`（`-Wall -Wextra`）/ `warnings = false` | ✅ |
 | `target_compile_options`（as error） | `werror = true`（`-Werror` / `/WX`） | ✅ |
 | `target_compile_features` | `c_std` / `cxx_std` | ✅ |
+| `INTERPROCEDURAL_OPTIMIZATION` | `lto = true`（`-flto` / `/GL` + `/LTCG`） | ✅ |
+| `add_library(ALIAS ...)` | `kind = "alias"` + `alias` | ✅ |
+| `enable_testing()` 并行运行 | `ns-build test -j N` | ✅ |
 | `target_precompile_headers` | `pch`（字符串或数组，`-include` / `/FI`） | ✅ |
 | `check_cxx_compiler_flag` / `CHECK_INCLUDE_FILE` | `[[checks]]` try-compile + 磁盘缓存 | ✅ |
 | `SOVERSION` | `soversion = "1"`（soname / install_name + 开发者符号链接） | ✅ |
 | `BUILD_RPATH` / `INSTALL_RPATH` | `rpath = [...]`（含 `$ORIGIN`） | ✅ |
-| `install(EXPORT)` / `find_package`（含 `.pc`） | `[[exports]]` / `[[imports]]`（TOML 配置；`pc = true` 生成 relocatable `.pc`） | ✅ |
+| `install(EXPORT)` / `find_package`（含 `.pc`） | `[[exports]]` / `[[imports]]`（TOML 配置；`pc = true` 生成 relocatable `.pc`；含 `version` 约束） | ✅ |
+| `CMAKE_INSTALL_BINDIR` 等 | `[install] bindir` / `libdir` / `includedir` | ✅ |
 | `CPack` | `ns-build package`（staging + `.tar.gz`/`.zip`） | ✅ |
 | `add_dependencies` | `deps`（顺序依赖） | ✅ |
 | `add_custom_command` | `[[custom_commands]]`（产物追踪 + 增量 + 链式构建） | ✅ |
 | `install(EXPORT)` / `find_package` | `[[exports]]` / `[[imports]]`（TOML 配置） | ✅ |
 | `cmake --preset` | `[presets]` + `--preset` | ✅ |
-| `FetchContent` / `ExternalProject` | `[[fetch]]`（git/url，按需拉取） | ✅ |
+| `FetchContent` / `ExternalProject` | `[[fetch]]`（git/url，按需拉取，含 `sha256` 校验） | ✅ |
+| `EXTPROJECT_URL_HASH` | `[[fetch]]` 的 `sha256` | ✅ |
+| `CPACK_MORE_FILES`/清单卸载 | `ns-build uninstall`（install 清单） | ✅ |
+| `pkg_check_modules(STATIC)` | `pkg_config_static`（`--libs --static`） | ✅ |
 | 构建配置 | `--release`/`--debug`/`--profile`（Release/Debug/RelWithDebInfo/MinSizeRel） | ✅ |
 | `option()` / 缓存变量 | `[defaults].variables` + `--define name=value` | ✅ |
 | `install(TARGETS)` | `install = true` | ✅ |
 | `install(FILES/DIRECTORY)` | `[[install_files]]` | ✅ |
+| `install(EXPORT)` + `.pc` | `[[exports]] pc = true`（relocatable `.pc`） | ✅ |
 | `install(DIRECTORY ... PATTERN EXCLUDE)` | `[[install_files]] exclude` | ✅ |
 | `enable_testing()` / `add_test` | `[[tests]]`（含 `timeout`/`labels`） | ✅ |
 | 生成器 | 自动平台默认（无需指定） | ✅ |
@@ -169,6 +189,7 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 | `find_package` / pkg-config | `pkg_config` | ✅ |
 | `file(GLOB)` | `sources = ["src/**/*.c"]` glob | ✅ |
 | `add_subdirectory` | `includes = ["sub"]` | ✅ |
+| `include_guard(GLOBAL)` | includes 菱形引用去重 | ✅ |
 | unity build | `groups` / `group_size`（默认 auto ≥4 源） | ✅ |
 | 生成 compile_commands.json | 自动生成 | ✅ |
 | `add_compile_options`/`add_definitions`（全局） | `[defaults].flags` / `defines` | ✅ |
@@ -206,8 +227,8 @@ groups = 2        # 300 个源文件分成 2 组，每组编译一个 .o
 ## 开发
 
 ```bash
-cargo test --lib          # 单元测试（58 个：解析/depfile/缓存/图/调度/编译器/导出配置/检测）
-cargo test --test e2e     # 端到端（24 个：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置/init/生成代码/预设/导出导入/fetch/checks/soversion/package）
+cargo test --lib          # 单元测试（59 个：解析/depfile/缓存/图/调度/编译器/导出配置/检测/LTO）
+cargo test --test e2e     # 端到端（43 个：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置/init/生成代码/预设/导出导入/fetch/sha256/checks/soversion/package/alias/doctor/并行测试/include/show --json/strip/link_dirs/pkg_config_static/uninstall/macOS@loader_path/imports version/自定义 install 目录名/审计回归）
 cargo test --test languages  # 多语言（C++ unity 推断等）
 cargo test --test perf    # 性能（300 文件全量 vs 增量）
 ./scripts/bench.sh        # 与 CMake+Ninja 对比基准

@@ -44,6 +44,8 @@ pub fn generate_compile_commands(plan: &Plan, cwd: &std::path::Path) -> String {
         entries.push(json!({
             "directory": directory,
             "command": command,
+            // arguments 数组：参数含空格时不会被错误切分（clangd 优先使用它）。
+            "arguments": node.command,
             "file": file,
             "output": node.output.to_string_lossy(),
         }));
@@ -105,11 +107,31 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
         }
     }
 
+    // 第零遍：为所有 target 创建 before 钩子节点（无依赖，先落地）。
+    // before 钩子保证同 target 内的编译/链接节点之前先执行，
+    // 常用于生成头文件 / 编译前的环境准备。
+    let mut before_hooks: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
+    for t in &script.targets {
+        if t.hooks.before.is_empty() {
+            continue;
+        }
+        let mut ids = Vec::with_capacity(t.hooks.before.len());
+        for cmd in &t.hooks.before {
+            let cid = make_command_node(&t.name, "before", cmd, &t.host);
+            ids.push(graph.add_node(cid));
+        }
+        before_hooks.insert(t.name.clone(), ids);
+    }
+
     // 第一遍：为每个 target 生成对象编译节点（含 unity）。
     let mut obj_nodes: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
     for t in &script.targets {
-        // phony / interface 无编译产物。
-        if matches!(t.kind, TargetKind::Phony | TargetKind::Interface) {
+        let hook_ids = before_hooks.get(&t.name).cloned().unwrap_or_default();
+        // phony / interface / alias 无编译产物。
+        if matches!(
+            t.kind,
+            TargetKind::Phony | TargetKind::Interface | TargetKind::Alias
+        ) {
             obj_nodes.insert(t.name.clone(), vec![]);
             continue;
         }
@@ -131,18 +153,67 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
             for c in customs {
                 graph.add_dep(id, c);
             }
+            // before 钩子全部就绪后再编译该 target 的对象文件。
+            for &h in &hook_ids {
+                graph.add_dep(id, h);
+            }
             ids.push(id);
         }
         obj_nodes.insert(t.name.clone(), ids);
     }
 
-    // 目标名 → 定义，供依赖解析。
+    // 目标名 → 定义，供依赖解析（alias → 最终目标）。
     let targets_by_name: BTreeMap<&str, &ResolvedTarget> =
         script.targets.iter().map(|t| (t.name.as_str(), t)).collect();
+    // 已声明过的 target 全集（含平台/when 过滤掉的）：用于区分"未声明"与"条件过滤"。
+    let declared: BTreeSet<&str> = script.declared.iter().map(|s| s.as_str()).collect();
 
+    // 传递求值：target 或其（传递）依赖含 C++ 源/语言 → 链接用 C++ 链接器。
+    // 静态库链里的 C++ 对象必须用 c++ 链接，否则 undefined symbols。
+    let unaliases: BTreeMap<String, String> = script
+        .targets
+        .iter()
+        .map(|t| (t.name.clone(), crate::script::unalias(&t.name, &script.targets)))
+        .collect();
+    let unalias_of = |dep: &str| -> String {
+        unaliases.get(dep).cloned().unwrap_or_else(|| dep.to_string())
+    };
+    let mut has_cxx_map: BTreeMap<String, bool> = script
+        .targets
+        .iter()
+        .map(|t| {
+            (
+                t.name.clone(),
+                t.sources.iter().any(|s| is_cxx(s))
+                    || matches!(t.language, Language::Cpp),
+            )
+        })
+        .collect();
+    for _ in 0..script.targets.len().max(1) {
+        let snapshot = has_cxx_map.clone();
+        let mut changed = false;
+        for t in &script.targets {
+            if has_cxx_map[&t.name] {
+                continue;
+            }
+            for dep in t.deps.iter().chain(t.private_deps.iter()) {
+                let ud = unalias_of(dep);
+                if snapshot.get(&ud).copied().unwrap_or(false) {
+                    has_cxx_map.insert(t.name.clone(), true);
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     // 第二遍：构造聚合/链接节点，并处理 deps。
     for t in &script.targets {
         match t.kind {
+            // alias 无产物：指向底层节点（第一遍结束后统一登记，见下）。
+            TargetKind::Alias => {}
             // phony / interface 无产物：生成空命令节点，保证依赖边可解析。
             TargetKind::Phony | TargetKind::Interface => {
                 let kind_name = if t.kind == TargetKind::Phony {
@@ -177,7 +248,7 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
                     }
                 } else {
                     // 非 C/C++：object 也走链接/打包任务。
-                    let link_id = make_simple_link(t, cache, &mut graph, &mut skipped)?;
+                    let link_id = make_simple_link(t, cache, &mut graph, &mut skipped, has_cxx_map.get(&t.name).copied().unwrap_or(false))?;
                     for s in &t.sources {
                         if let Some(&c) = custom_by_out.get(s) {
                             graph.add_dep(link_id, c);
@@ -201,10 +272,15 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
                 }
                 let mut seen_libs: BTreeSet<String> = BTreeSet::new();
                 for dep in t.deps.iter().chain(t.private_deps.iter()) {
-                    let dep_t = targets_by_name
-                        .get(dep.as_str())
-                        .ok_or_else(|| format!("target '{}' 依赖不存在的 target '{}'", t.name, dep))?;
-                    let dep_ids = obj_nodes.get(dep).cloned().unwrap_or_default();
+                    let ud = unalias_of(dep);
+                    let Some(dep_t) = targets_by_name.get(ud.as_str()).copied() else {
+                        // 声明但被条件过滤的依赖：跳过（不链接、不建边）。
+                        if declared.contains(ud.as_str()) {
+                            continue;
+                        }
+                        return Err(format!("target '{}' 依赖不存在的 target '{}'", t.name, dep));
+                    };
+                    let dep_ids = obj_nodes.get(ud.as_str()).cloned().unwrap_or_default();
                     match dep_t.kind {
                         // object 库：把对象并入链接（静态库归档也并入成员）。
                         TargetKind::Object => {
@@ -225,16 +301,18 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
                         TargetKind::Static | TargetKind::Lib | TargetKind::Module
                             if t.kind != TargetKind::Static && is_native_c(t) => {
                                 collect_link_libs(
-                                    dep,
+                                    &ud,
                                     &targets_by_name,
                                     &mut link_inputs,
                                     &mut seen_libs,
+                                    &unaliases,
                                 );
                             }
                         _ => {}
                     }
                 }
-                let link_task = make_link_task(t, link_inputs, t.host, t.profile, &t.ar);
+                let link_is_cpp = has_cxx_map.get(&t.name).copied().unwrap_or(false);
+                let link_task = make_link_task(t, link_inputs, t.host, t.profile, &t.ar, link_is_cpp);
                 let link_cmd_hash = hash_cmd(&link_task.command);
                 let link_inputs = link_task.inputs.clone();
                 let cached = cache.hit(&link_task.key, &link_inputs, &link_cmd_hash);
@@ -271,24 +349,47 @@ pub fn plan(script: &ResolvedScript, cache: &Cache) -> Result<Plan, String> {
         }
     }
 
+    // alias 登记：alias 名 → 底层 target 的节点（共享同一构建节点）。
+    for t in &script.targets {
+        if t.kind != TargetKind::Alias {
+            continue;
+        }
+        let ud = unalias_of(&t.name);
+        match outputs.get(ud.as_str()) {
+            Some(&nid) => {
+                outputs.insert(t.name.clone(), nid);
+            }
+            None => {
+                return Err(format!(
+                    "alias 目标 '{}' 指向不存在的 target '{}'",
+                    t.name, ud
+                ));
+            }
+        }
+    }
+
     // 第三遍：target 间 deps 边 + 钩子。
     for t in &script.targets {
         let Some(&me) = outputs.get(&t.name) else {
             continue;
         };
+        // before 钩子：me 必须等钩子跑完。obj 节点在第一遍已挂依赖，此处覆盖
+        // phony/interface/alias/Non-C 等无 obj 节点的目标。
+        if let Some(hooks) = before_hooks.get(&t.name) {
+            for &h in hooks {
+                graph.add_dep(me, h);
+            }
+        }
         for dep in t.deps.iter().chain(t.private_deps.iter()) {
-            let Some(&dn) = outputs.get(dep) else {
+            let ud = unalias_of(dep);
+            let Some(&dn) = outputs.get(ud.as_str()) else {
+                if declared.contains(ud.as_str()) {
+                    continue; // 声明但被条件过滤：跳过
+                }
                 return Err(format!("target '{}' 依赖不存在的 target '{}'", t.name, dep));
             };
             if dn != me {
                 graph.add_dep(me, dn);
-            }
-        }
-        if !t.hooks.before.is_empty() {
-            for cmd in &t.hooks.before {
-                let cid = make_command_node(&t.name, "before", cmd, &t.host);
-                let cid = graph.add_node(cid);
-                graph.add_dep(me, cid);
             }
         }
         if !t.hooks.after.is_empty() {
@@ -338,61 +439,72 @@ fn plan_object_nodes(
     let groups = decide_groups(t, n_src, unity_mode, parallel);
 
     if let Some(groups) = groups {
-        // 将源文件均分为 groups 组，每组一个 .o。
+        // 将源文件按语言拆分后再均分为 groups 组（C 与 C++ 绝不混合编译）。
         let per = n_src.div_ceil(groups);
         let unity_dir = out_dir.join("unity");
         let _ = std::fs::create_dir_all(&unity_dir);
-        for (gi, chunk) in t.sources.chunks(per).enumerate() {
-            let chunk_cxx = t.language == Language::Cpp || chunk.iter().any(|s| is_cxx(s));
-            let ext = if chunk_cxx { "cpp" } else { "c" };
-            let obj = obj_dir.join(format!("{}_{}.o", safe_name(&t.name), gi));
-            let depfile = obj_dir.join(format!("{}_{}.d", safe_name(&t.name), gi));
-            let unity_src = unity_dir.join(format!("{}_{}.{ext}", safe_name(&t.name), gi));
-            let _ = std::fs::write(&unity_src, unity_source_content(chunk));
-            let compiler = if chunk_cxx { &t.cxx } else { &t.cc };
-            let node_depfile = if crate::compiler::is_msvc_compiler(compiler) { None } else { Some(depfile.clone()) };
-            let cmd = unity_compile_command(
-                &CompileContext {
-                    cc: compiler,
-                    target: t,
-                    profile: t.profile,
-                    is_cxx: chunk_cxx,
-                },
-                &unity_src,
-                &obj,
-                &depfile,
-            );
-            let key = format!("unity:{}:{}", t.name, gi);
-            let cmd_hash = hash_cmd(&cmd);
-            // 缓存判定需把 depfile 里的头文件算进输入（否则改头文件不重编）。
-            let hit_inputs = effective_inputs(chunk, &depfile);
-            let cached = cache.hit(&key, &hit_inputs, &cmd_hash);
-            if cached {
-                *skipped += 1;
+        let mut lang_groups: Vec<(bool, Vec<PathBuf>)> =
+            vec![(false, vec![]), (true, vec![])];
+        for s in &t.sources {
+            lang_groups[is_cxx(s) as usize].1.push(s.clone());
+        }
+        let mut gi = 0usize;
+        for (chunk_cxx, srcs) in lang_groups {
+            if srcs.is_empty() {
+                continue;
             }
-            let inputs = if cached { hit_inputs } else { chunk.to_vec() };
-            let custom_deps: Vec<NodeId> = {
-                let mut v: Vec<NodeId> = chunk
-                    .iter()
-                    .filter_map(|s| custom_by_out.get(s).copied())
-                    .collect();
-                v.sort_unstable();
-                v.dedup();
-                v
-            };
-            nodes.push((Node {
-                id: 0,
-                key,
-                kind: TaskKind::Compile,
-                inputs,
-                depfile: node_depfile,
-                output: obj,
-                extra_outputs: vec![],
-                command: cmd,
-                parallel: t.parallel,
-                label: format!("CC {} [{}]", t.name, chunk.len()),
-                cached,
-            }, custom_deps));
+            for chunk in srcs.chunks(per) {
+                let ext = if chunk_cxx { "cpp" } else { "c" };
+                let obj = obj_dir.join(format!("{}_{}.o", safe_name(&t.name), gi));
+                let depfile = obj_dir.join(format!("{}_{}.d", safe_name(&t.name), gi));
+                let unity_src = unity_dir.join(format!("{}_{}.{ext}", safe_name(&t.name), gi));
+                gi += 1;
+                let _ = std::fs::write(&unity_src, unity_source_content(chunk));
+                let compiler = if chunk_cxx { &t.cxx } else { &t.cc };
+                let node_depfile = if crate::compiler::is_msvc_compiler(compiler) { None } else { Some(depfile.clone()) };
+                let cmd = unity_compile_command(
+                    &CompileContext {
+                        cc: compiler,
+                        target: t,
+                        profile: t.profile,
+                        is_cxx: chunk_cxx,
+                    },
+                    &unity_src,
+                    &obj,
+                    &depfile,
+                );
+                let key = format!("unity:{}:{}", t.name, gi - 1);
+                let cmd_hash = hash_cmd(&cmd);
+                // 缓存判定需把 depfile 里的头文件算进输入（否则改头文件不重编）。
+                let hit_inputs = effective_inputs(chunk, &depfile);
+                let cached = cache.hit(&key, &hit_inputs, &cmd_hash);
+                if cached {
+                    *skipped += 1;
+                }
+                let inputs = if cached { hit_inputs } else { chunk.to_vec() };
+                let custom_deps: Vec<NodeId> = {
+                    let mut v: Vec<NodeId> = chunk
+                        .iter()
+                        .filter_map(|s| custom_by_out.get(s).copied())
+                        .collect();
+                    v.sort_unstable();
+                    v.dedup();
+                    v
+                };
+                nodes.push((Node {
+                    id: 0,
+                    key,
+                    kind: TaskKind::Compile,
+                    inputs,
+                    depfile: node_depfile,
+                    output: obj,
+                    extra_outputs: vec![],
+                    command: cmd,
+                    parallel: t.parallel,
+                    label: format!("CC {} [{}]", t.name, chunk.len()),
+                    cached,
+                }, custom_deps));
+            }
         }
     } else {
         for (i, src) in t.sources.iter().enumerate() {
@@ -402,7 +514,7 @@ fn plan_object_nodes(
                 .unwrap_or("src");
             let obj = obj_dir.join(format!("{}_{}_{}.o", safe_name(&t.name), i, safe_name(stem)));
             let depfile = obj_dir.join(format!("{}_{}_{}.d", safe_name(&t.name), i, safe_name(stem)));
-            let is_cxx_src = t.language == Language::Cpp || is_cxx(src);
+            let is_cxx_src = is_cxx(src);
             let compiler = if is_cxx_src { &t.cxx } else { &t.cc };
             let node_depfile = if crate::compiler::is_msvc_compiler(compiler) { None } else { Some(depfile.clone()) };
             let cmd = compile_command(
@@ -448,16 +560,19 @@ fn plan_object_nodes(
 }
 
 /// 递归收集 target 依赖的静态/动态库产物（用于最终链接）。
+/// `unaliases` 来自预计算表（alias → 最终目标名）。
 fn collect_link_libs(
     name: &str,
     targets: &BTreeMap<&str, &ResolvedTarget>,
     out: &mut Vec<PathBuf>,
     seen: &mut BTreeSet<String>,
+    unaliases: &BTreeMap<String, String>,
 ) {
-    if !seen.insert(name.to_string()) {
+    let ud = unaliases.get(name).cloned().unwrap_or_else(|| name.to_string());
+    if !seen.insert(ud.clone()) {
         return;
     }
-    let Some(t) = targets.get(name) else {
+    let Some(t) = targets.get(ud.as_str()) else {
         return;
     };
     if matches!(
@@ -468,7 +583,7 @@ fn collect_link_libs(
         out.push(t.output.clone());
     }
     for dep in t.deps.iter().chain(t.private_deps.iter()) {
-        collect_link_libs(dep, targets, out, seen);
+        collect_link_libs(dep, targets, out, seen, unaliases);
     }
 }
 
@@ -483,8 +598,9 @@ fn make_simple_link(
     cache: &Cache,
     graph: &mut BuildGraph,
     skipped: &mut usize,
+    link_is_cpp: bool,
 ) -> Result<NodeId, String> {
-    let link_task = make_link_task(t, t.sources.clone(), t.host, t.profile, &t.ar);
+    let link_task = make_link_task(t, t.sources.clone(), t.host, t.profile, &t.ar, link_is_cpp);
     let cmd_hash = hash_cmd(&link_task.command);
     let inputs = link_task.inputs.clone();
     let cached = cache.hit(&link_task.key, &inputs, &cmd_hash);
@@ -656,6 +772,7 @@ mod tests {
             deps: vec![],
             private_deps: vec![],
             output: PathBuf::from("out"),
+            alias: None,
             groups: Some(2),
             group_size: None,
             parallel: true,
@@ -664,6 +781,7 @@ mod tests {
             strip: false,
             warnings: true,
             werror: false,
+            lto: false,
             rpath: vec![],
             soversion: None,
             install: true,
@@ -671,6 +789,7 @@ mod tests {
             c_std: None,
             cxx_std: None,
             pkg_config: vec![],
+            pkg_config_static: vec![],
             when: None,
             pch: vec![],
         };
@@ -698,6 +817,7 @@ mod tests {
             deps: vec![],
             private_deps: vec![],
             output: PathBuf::from("out"),
+            alias: None,
             groups: None,
             group_size: Some(3),
             parallel: true,
@@ -706,6 +826,7 @@ mod tests {
             strip: false,
             warnings: true,
             werror: false,
+            lto: false,
             rpath: vec![],
             soversion: None,
             install: true,
@@ -713,6 +834,7 @@ mod tests {
             c_std: None,
             cxx_std: None,
             pkg_config: vec![],
+            pkg_config_static: vec![],
             when: None,
             pch: vec![],
         };
@@ -740,6 +862,7 @@ mod tests {
             deps: vec![],
             private_deps: vec![],
             output: PathBuf::from("out"),
+            alias: None,
             groups: None,
             group_size: None,
             parallel: true,
@@ -748,6 +871,7 @@ mod tests {
             strip: false,
             warnings: true,
             werror: false,
+            lto: false,
             rpath: vec![],
             soversion: None,
             install: true,
@@ -755,6 +879,7 @@ mod tests {
             c_std: None,
             cxx_std: None,
             pkg_config: vec![],
+            pkg_config_static: vec![],
             when: None,
             pch: vec![],
         };

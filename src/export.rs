@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 pub struct ExportPackage {
     pub name: String,
     pub version: String,
+    /// 安装库目录名（如 `lib64`）；默认 `lib`（旧配置无此字段时按 `lib` 处理）。
+    pub libdir: String,
+    pub license: String,
+    pub description: String,
 }
 
 /// 导出包中的一个目标。
@@ -73,11 +77,24 @@ pub fn load_import(base_dir: &Path, from: &str, name: &str) -> Result<LoadedExpo
         // B. from 目录直接含 <name>-config.toml。
         if !name.is_empty() {
             candidates.push(from_p.join(format!("{name}-config.toml")));
-            // C. <from>/lib/cmake/<name>/<name>-config.toml（及 share、平铺两种）。
-            candidates.push(from_p.join("lib").join("cmake").join(name).join(format!("{name}-config.toml")));
-            candidates.push(from_p.join("share").join("cmake").join(name).join(format!("{name}-config.toml")));
-            candidates.push(from_p.join("lib").join("cmake").join(format!("{name}-config.toml")));
-            candidates.push(from_p.join("share").join("cmake").join(format!("{name}-config.toml")));
+            // C. 任意一级子目录下都可能是 <libdir>/cmake/<name>/[...]-config.toml（lib/lib64/share 等）。
+            if let Ok(entries) = std::fs::read_dir(&from_p) {
+                for entry in entries.flatten() {
+                    let sub = entry.path();
+                    if !sub.is_dir() {
+                        continue;
+                    }
+                    candidates.push(sub.join("cmake").join(name).join(format!("{name}-config.toml")));
+                    candidates.push(sub.join("cmake").join(format!("{name}-config.toml")));
+                }
+            }
+            // 兜底常见位置（read_dir 失败时仍能找到）。
+            candidates.push(from_p.join("lib/cmake").join(name).join(format!("{name}-config.toml")));
+            candidates.push(from_p.join("lib64/cmake").join(name).join(format!("{name}-config.toml")));
+            candidates.push(from_p.join("share/cmake").join(name).join(format!("{name}-config.toml")));
+            candidates.push(from_p.join("lib/cmake").join(format!("{name}-config.toml")));
+            candidates.push(from_p.join("lib64/cmake").join(format!("{name}-config.toml")));
+            candidates.push(from_p.join("share/cmake").join(format!("{name}-config.toml")));
         }
     }
     for f in candidates {
@@ -116,22 +133,20 @@ fn prefix_for_config_path(f: &Path) -> PathBuf {
     let parent = f.parent().unwrap_or(Path::new("/"));
     // 平铺：<pfx>/lib/cmake/<name>-config.toml → parent(lib/cmake) → 上溯 2 级 = pfx? 不对：
     // parent = lib/cmake，grandparent(lib) → 上溯 2 = pfx 的上级。故平铺按 parent-parent.parent? 平铺时直接取<two levels up> lib→pfx。
-    let is_layout = |p: &Path| {
+    fn is_layout(p: &Path) -> bool {
         p.file_name().is_some_and(|n| n == "cmake")
-            && p.parent()
-                .and_then(|gp| gp.file_name())
-                .is_some_and(|n| n == "lib" || n == "share")
-    };
+            && p.parent().and_then(|gp| gp.file_name()).is_some()
+    }
     // 嵌套布局 <pfx>/lib/cmake/<name>/<file>：parent=<pfx>/lib/cmake/<name>
     if let Some(p) = parent.parent() {
-        if is_layout(p) {
+        if (is_layout)(p) {
             if let Some(pfx) = p.parent().and_then(|gp| gp.parent()) {
                 return pfx.to_path_buf();
             }
         }
     }
     // 平铺布局 <pfx>/lib/cmake/<file>：parent == lib/cmake
-    if is_layout(parent) {
+    if (is_layout)(parent) {
         if let Some(pfx) = parent.parent().and_then(|gp| gp.parent()) {
             return pfx.to_path_buf();
         }
@@ -155,12 +170,15 @@ pub fn pc_lib_name(output: &str) -> Option<String> {
 }
 
 /// 生成 relocatable 的 pkg-config `.pc` 内容（prefix = ${pcfiledir}/../..）。
+/// `libdir`/`includedir` 为安装目录名（如 `lib64`、`include64`）。
 pub fn render_pc_file(
     name: &str,
     description: &str,
     version: &str,
     libs: &[String],
     libs_private: &[String],
+    libdir: &str,
+    includedir: &str,
 ) -> String {
     let libs_flag = libs
         .iter()
@@ -171,8 +189,8 @@ pub fn render_pc_file(
     format!(
         "prefix=${{pcfiledir}}/../..\n\
          exec_prefix=${{prefix}}\n\
-         libdir=${{exec_prefix}}/lib\n\
-         includedir=${{prefix}}/include\n\
+         libdir=${{exec_prefix}}/{libdir}\n\
+         includedir=${{prefix}}/{includedir}\n\
          \n\
          Name: {name}\n\
          Description: {description}\n\
@@ -198,9 +216,80 @@ pub fn pc_private_lib(l: &str) -> String {
     }
 }
 
+/// 比较 `a` 与 `b` 的半语义版本（按 `.` 分段的数字比较，缺段按 0）。
+/// 返回 std::cmp::Ordering 风格的 -1/0/1。
+fn cmp_version(a: &str, b: &str) -> Result<i64, String> {
+    fn parse(v: &str) -> Result<Vec<i64>, String> {
+        let mut out = Vec::new();
+        for seg in v.trim().split('.') {
+            let n: i64 = seg
+                .parse()
+                .map_err(|_| format!("版本 '{v}' 含非数字段 '{seg}'"))?;
+            out.push(n);
+        }
+        if out.is_empty() {
+            return Err(format!("版本 '{v}' 为空"));
+        }
+        Ok(out)
+    }
+    let (a, b) = (parse(a)?, parse(b)?);
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        if x != y {
+            return Ok(if x < y { -1 } else { 1 });
+        }
+    }
+    Ok(0)
+}
+
+/// 检查 `actual` 是否满足约束 `constraint`：
+/// `>=` / `<=` / `>` / `<` / `=` / `!=`，不带操作符等价 `=`。
+pub(crate) fn version_matches(constraint: &str, actual: &str) -> Result<bool, String> {
+    let c = constraint.trim();
+    // 提取操作符前缀。
+    let (op, rhs) = [">=", "<=", "!=", ">", "<", "="]
+        .iter()
+        .find_map(|p| c.strip_prefix(p).map(|r| (*p, r.trim())))
+        .unwrap_or(("=", c));
+    if rhs.is_empty() {
+        return Err(format!("版本约束 '{constraint}' 缺少版本号"));
+    }
+    let ord = cmp_version(actual, rhs)?;
+    Ok(match op {
+        ">=" => ord >= 0,
+        "<=" => ord <= 0,
+        ">" => ord > 0,
+        "<" => ord < 0,
+        "=" => ord == 0,
+        "!=" => ord != 0,
+        _ => return Err(format!("未知操作符 '{op}'")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_constraint_matches() {
+        assert!(version_matches(">=1.2.0", "1.2.3").unwrap());
+        assert!(version_matches(">=1.2.0", "1.2.0").unwrap());
+        assert!(!version_matches(">=2.0.0", "1.2.3").unwrap());
+        assert!(!version_matches(">1.0.0", "1.0.0").unwrap());
+        assert!(version_matches("<=1.2.3", "1.2.3").unwrap());
+        assert!(version_matches("<2.0.0", "1.2.3").unwrap());
+        assert!(version_matches("=1.2.3", "1.2.3").unwrap());
+        assert!(version_matches("1.2.3", "1.2.3").unwrap());
+        assert!(!version_matches("!=1.0.0", "1.0.0").unwrap());
+        assert!(version_matches("!=2.0.0", "1.0.0").unwrap());
+        // 段数不齐也按 0 补齐比较。
+        assert!(version_matches(">=1.2", "1.2.0").unwrap());
+        assert!(!version_matches(">=1.2.1", "1.2").unwrap());
+        assert!(version_matches(">=abc", "1.0.0").is_err());
+        assert!(version_matches(">=", "1.0.0").is_err());
+    }
 
     #[test]
     fn prefix_nested_layout() {
@@ -232,6 +321,9 @@ mod tests {
             package: ExportPackage {
                 name: "libx".into(),
                 version: "1.2.3".into(),
+                libdir: "lib".into(),
+                license: String::new(),
+                description: String::new(),
             },
             targets: vec![ExportedTarget {
                 name: "core".into(),
