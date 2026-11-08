@@ -486,25 +486,39 @@ fn install_directory(
             }
             // 符号链接：保留为链接本体直接复制（不能跟进，避免环）。
             if meta.file_type().is_symlink() {
-                let dest_rel = if keep_structure { rel } else { path.file_name().map(Path::new).unwrap_or(rel) };
+                let dest_rel = if keep_structure {
+                    rel
+                } else {
+                    path.file_name().map(Path::new).unwrap_or(rel)
+                };
                 let dest = to_base.join(dest_rel);
-                let target = std::fs::read_link(&path)
-                    .map_err(|e| format!("read_link {} 失败: {e}", path.display()))?;
                 #[cfg(unix)]
                 {
+                    let target = std::fs::read_link(&path)
+                        .map_err(|e| format!("read_link {} 失败: {e}", path.display()))?;
                     let _ = std::fs::remove_file(&dest);
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)
                             .map_err(|e| format!("创建 {} 失败: {e}", parent.display()))?;
                     }
-                    std::os::unix::fs::symlink(&target, &dest)
-                        .map_err(|e| format!("symlink {} -> {} 失败: {e}", target.display(), dest.display()))?;
+                    std::os::unix::fs::symlink(&target, &dest).map_err(|e| {
+                        format!(
+                            "symlink {} -> {} 失败: {e}",
+                            target.display(),
+                            dest.display()
+                        )
+                    })?;
                 }
                 #[cfg(not(unix))]
                 {
                     // 非 unix 退化为普通复制（链接环场景主要在 unix 文件系统）。
-                    std::fs::copy(&path, &dest)
-                        .map_err(|e| format!("复制符号链接 {} -> {} 失败: {e}", path.display(), dest.display()))?;
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("创建 {} 失败: {e}", parent.display()))?;
+                    }
+                    std::fs::copy(&path, &dest).map_err(|e| {
+                        format!("复制符号链接 {} -> {} 失败: {e}", path.display(), dest.display())
+                    })?;
                 }
                 manifest.push(dest.clone());
                 report.installed += 1;

@@ -44,7 +44,7 @@ jobs:
             archive: tar.gz
           - os_name: macos
             arch: arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
           - os_name: windows

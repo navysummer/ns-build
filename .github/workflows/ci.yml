@@ -40,7 +40,7 @@ jobs:
             test: full
           - os_name: macos
             arch: arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
             test: full
           - os_name: windows
