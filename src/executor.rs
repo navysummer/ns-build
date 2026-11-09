@@ -222,42 +222,72 @@ pub fn execute(
             }
         }
 
-        // 等待一个结果。
-        let result = rx.recv().map_err(|_| "任务通道关闭".to_string())?;
-        done[result.id] = true;
-        pending -= 1;
-        if result.ok {
-            let node = plan.graph.node(result.id);
-            let actually_built = !node.cached;
-            if actually_built {
-                if !node.output.as_os_str().is_empty() {
-                    let cmd_hash = hash_cmd(&node.command);
-                    let mut outs: Vec<String> =
-                        node.extra_outputs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-                    outs.insert(0, node.output.to_string_lossy().into_owned());
-                    let rec_inputs = refresh_compile_inputs(node, &result.inputs);
-                    cache.record(node.key.clone(), &rec_inputs, cmd_hash, outs);
-                    // 输入变了 → 使所有依赖此产物的后继缓存失效。
-                    let rdeps: Vec<NodeId> = plan.graph.rdeps_of(result.id).iter().copied().collect();
-                    for r in rdeps {
-                        plan.graph.node_mut(r).cached = false;
+        // 等待一个结果。用短超时 + 回到顶部复查：工作线程先 send 后
+        // fetch_sub，存在 running 过期（偏高）的窗口；若在此窗口内阻塞
+        // recv 且该线程已发送最后一条结果后不再发送，会永久等待。
+        // 短超时回到循环顶部复查 running/ready 即可自愈（同排空循环）。
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(result) => {
+                done[result.id] = true;
+                pending -= 1;
+                if result.ok {
+                    let node = plan.graph.node(result.id);
+                    let actually_built = !node.cached;
+                    if actually_built {
+                        if !node.output.as_os_str().is_empty() {
+                            let cmd_hash = hash_cmd(&node.command);
+                            let mut outs: Vec<String> =
+                                node.extra_outputs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                            outs.insert(0, node.output.to_string_lossy().into_owned());
+                            let rec_inputs = refresh_compile_inputs(node, &result.inputs);
+                            cache.record(node.key.clone(), &rec_inputs, cmd_hash, outs);
+                            // 输入变了 → 使所有依赖此产物的后继缓存失效。
+                            let rdeps: Vec<NodeId> =
+                                plan.graph.rdeps_of(result.id).iter().copied().collect();
+                            for r in rdeps {
+                                plan.graph.node_mut(r).cached = false;
+                            }
+                        }
+                        report.built += 1;
                     }
+                } else {
+                    failed.store(true, Ordering::SeqCst);
+                    report.failed += 1;
                 }
-                report.built += 1;
+                unlock_rdeps(result.id, &plan.graph, &mut indeg, &mut ready, &done);
             }
-        } else {
-            failed.store(true, Ordering::SeqCst);
-            report.failed += 1;
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("任务通道关闭".to_string());
+            }
         }
-        unlock_rdeps(result.id, &plan.graph, &mut indeg, &mut ready, &done);
     }
 
     report.elapsed = start.elapsed().as_secs_f64();
     // 失败时等待所有在途任务完成，避免悬空线程。
-    while running.load(Ordering::SeqCst) > 0 {
-        let Ok(result) = rx.recv() else { break };
+    // 注意：工作线程先 send 再 fetch_sub。存在一个窗口：主线程看到
+    // running==0（本线程递减已提交）但最后一条结果尚未被本循环消费；
+    // 此时不能无条件阻塞 rx.recv()（会永久等待），而应短超时重查 running。
+    loop {
+        if running.load(Ordering::SeqCst) == 0 {
+            // 在途计数已清零；消费残留结果（若存在），然后结束。
+            loop {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        done[result.id] = true;
+                        unlock_rdeps(result.id, &plan.graph, &mut indeg, &mut ready, &done);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+            break;
+        }
+        // 仍有在途任务：阻塞等待一条结果；短超时后回到顶部复查 running。
+        let Some(result) = rx.recv_timeout(std::time::Duration::from_millis(50)).ok() else {
+            continue;
+        };
         done[result.id] = true;
-        let _ = result.id;
         unlock_rdeps(result.id, &plan.graph, &mut indeg, &mut ready, &done);
     }
     Ok(report)
@@ -366,5 +396,53 @@ mod tests {
         let opts = ExecOptions { parallel: 4, quiet: true, verbose: false, targets: None };
         let rep = execute(&mut plan, &mut cache, &opts, &dir).unwrap();
         assert_eq!(rep.built, 2);
+    }
+
+    /// 回归测试：主循环退出后进入排空循环时，最后一个工作线程可能处于
+    /// "已 send 未 fetch_sub" 的窗口。排空循环必须自我修复（running==0 时
+    /// 消费残留并结束），不能无条件阻塞 rx.recv()。多次迭代放大命中概率。
+    #[test]
+    fn drain_loop_does_not_deadlock_on_last_task() {
+        for i in 0..200 {
+            let mut g = BuildGraph::new();
+            let _a = g.add_node(simple_node(
+                &format!("t{i}"),
+                vec!["sh".into(), "-c".into(), "true".into()],
+            ));
+            let mut plan = Plan { graph: g, outputs: Default::default(), skipped: 0 };
+            let dir = std::env::temp_dir();
+            let cache = dir.join("nsbuild-exec-drain-test");
+            let mut cache = Cache::load(&cache).unwrap();
+            let opts = ExecOptions { parallel: 1, quiet: true, verbose: false, targets: None };
+            let rep = execute(&mut plan, &mut cache, &opts, &dir).unwrap();
+            assert_eq!(rep.built, 1, "迭代 {i} 应构建 1 个任务");
+        }
+    }
+
+    /// 回归测试：串行任务等待并发任务清空时，主线程可能在 running 过期
+    /// （偏高）窗口内阻塞 rx.recv()（原第 226 行），而该工作线程已发送最后
+    /// 一条结果、不会再发送 → 永久死锁。并发节点 + 串行节点 + 多次迭代放大。
+    #[test]
+    fn serial_task_after_concurrent_does_not_deadlock() {
+        for i in 0..200 {
+            let mut g = BuildGraph::new();
+            // 一个并发任务（快速空命令），随后一个串行任务依赖它。
+            let c = g.add_node(simple_node(
+                &format!("c{i}"),
+                vec!["sh".into(), "-c".into(), "true".into()],
+            ));
+            let mut s = simple_node(&format!("s{i}"), vec!["sh".into(), "-c".into(), "true".into()]);
+            s.parallel = false; // 串行任务
+            let s = g.add_node(s);
+            g.add_dep(s, c);
+            let mut plan = Plan { graph: g, outputs: Default::default(), skipped: 0 };
+            let dir = std::env::temp_dir();
+            let cache = dir.join("nsbuild-exec-serial-test");
+            let mut cache = Cache::load(&cache).unwrap();
+            // parallel=2 让并发任务先跑，串行任务在 ready 中等待 running 清空。
+            let opts = ExecOptions { parallel: 2, quiet: true, verbose: false, targets: None };
+            let rep = execute(&mut plan, &mut cache, &opts, &dir).unwrap();
+            assert_eq!(rep.built, 2, "迭代 {i} 应构建 2 个任务");
+        }
     }
 }

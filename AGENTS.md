@@ -182,18 +182,19 @@ src/
 - **unity build**：生成 `build/unity/<target>_<i>.c`（内容为各源 `#include`），编译单文件避免多源 `-o` 冲突与重复启动开销。
 - **命令指纹**：完整命令数组 join 后 blake3 哈希，任何编译参数变化都会使缓存失效。
 - **并行度控制**：`running` 原子计数与 `opts.parallel` 比较，防止超限派发。
+- **等待自愈**：工作线程先 `send` 结果再 `fetch_sub` 递减 `running`，两者间存在 `running` 过期（偏高）窗口。主线程/排空循环一律用短超时 `recv_timeout` 并回到顶部复查 `running`/`ready`，避免在该窗口内无条件阻塞 `recv()` 导致的死锁。
 
 ## 测试
 
 ```bash
-cargo test --lib      # 单元测试（59：解析/depfile/缓存/图/调度/编译器/脚本规范化/导出配置/检测/LTO）
+*cargo test --lib      # 单元测试（62：解析/depfile/缓存/图/调度/编译器/脚本规范化/导出配置/检测/LTO）
 cargo test --test e2e # 端到端（43：构建/运行/增量/分步/unity/静态·动态库/安装/过滤/钩子/配置/init/生成代码/预设/导出导入/fetch/sha256/checks/package/alias/doctor/include/strip/json/link_dirs/static/uninstall/自定义布局/审计回归）
 cargo test --test languages # 多语言 e2e（8：含 C++ unity 与 C++ 推断）
 cargo test --test perf # 性能：300 文件全量 vs 增量（增量应显著更快）
 ./scripts/bench.sh    # 与 CMake + Ninja 对比基准（NS_BENCH_N 可调规模）
 ```
 
-**当前全部绿**：60 lib + 3 main(CLI) + 43 e2e + 8 languages + 1 perf = **115 个测试，0 警告 0 错误**（不使用 `#[allow]`/`#[warn]` 等抑制手段；`cargo clippy --all-targets` 亦零警告）。
+**当前全部绿**：62 lib + 3 main(CLI) + 43 e2e + 8 languages + 1 perf = **117 个测试，0 警告 0 错误**（不使用 `#[allow]`/`#[warn]` 等抑制手段；`cargo clippy --all-targets` 亦零警告）。
 
 **性能对比**（300 文件 C 项目，macOS 12 核 clang 17，`scripts/bench.sh`）：
 
